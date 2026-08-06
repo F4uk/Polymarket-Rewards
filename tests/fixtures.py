@@ -7,6 +7,7 @@ from typing import Any, Dict, List
 TOKEN_A = "token-a"
 TOKEN_B = "token-b"
 TOKEN_C = "token-c"
+TOKEN_D = "token-d"
 
 
 def market_fixture(

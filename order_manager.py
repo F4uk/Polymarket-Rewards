@@ -1158,6 +1158,14 @@ class OrderManager:
             
             if not token_id:
                 continue
+
+            # 库存未清或存在待退出 SELL 时禁止新 BUY
+            if self.has_inventory_or_pending_exit(token_id):
+                logger.info(
+                    f"市场 {market_id} token {outcome} 有库存或待退出订单，禁止新 BUY"
+                )
+                results[token_id] = False
+                continue
             
             # 强制实时获取订单簿数据（避免使用过期数据造成损失）
             orderbook = self._get_orderbook(token_id)
@@ -3377,6 +3385,72 @@ class OrderManager:
             logger.error(f"取消所有购买挂单失败: {e}")
         
         return cancelled_count
+
+    def remove_market(self, market_id: str) -> int:
+        """Remove a market from trading: cancel its BUY orders only.
+
+        SELL orders, inventory exit state, and reconciliation state are kept.
+        Pending BUY reorders for the market are cleared.
+        """
+        cancelled_count = 0
+        buy_order_ids: List[str] = []
+        token_ids: List[str] = []
+        with self.lock:
+            tokens_dict = self.active_orders.get(market_id, {})
+            for token_id, sides_dict in tokens_dict.items():
+                token_ids.append(token_id)
+                buy_info = sides_dict.get("BUY")
+                if buy_info and buy_info.get("order_id"):
+                    buy_order_ids.append(buy_info["order_id"])
+            # 清理与该市场新 BUY 相关的 pending reorder
+            for token_id in token_ids:
+                self.pending_reorder_tokens.pop(token_id, None)
+            for token_id, pending_info in list(self.pending_reorder_tokens.items()):
+                if pending_info.get("market_id") == market_id:
+                    self.pending_reorder_tokens.pop(token_id, None)
+            # 清理 requote 确认状态（不删除库存状态）
+            for token_id in token_ids:
+                self.requote_confirmations.pop(token_id, None)
+
+        for order_id in buy_order_ids:
+            if self.cancel_order(order_id):
+                cancelled_count += 1
+                self.metrics["buys_cancelled"] += 1
+        logger.info(f"市场 {market_id} 已移除：取消 {cancelled_count} 个 BUY（SELL/库存保留）")
+        return cancelled_count
+
+    def refresh_market_selection(
+        self,
+        previous_market_ids: set,
+        new_market_ids: set,
+        new_selected_markets: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Apply a set-diff market refresh (retained / removed / added)."""
+        retained = sorted(previous_market_ids & new_market_ids)
+        removed = sorted(previous_market_ids - new_market_ids)
+        added = sorted(new_market_ids - previous_market_ids)
+        by_id = {m.get("market_id"): m for m in new_selected_markets if m.get("market_id")}
+
+        result: Dict[str, Any] = {
+            "retained": retained,
+            "removed": removed,
+            "added": added,
+            "cancelled_buys": 0,
+            "placed_markets": 0,
+        }
+        self.metrics["retained_markets"] = float(len(retained))
+
+        for market_id in removed:
+            result["cancelled_buys"] += self.remove_market(market_id)
+
+        for market_id in added:
+            market = by_id.get(market_id)
+            if not market:
+                continue
+            placed = self.place_market_orders(market, {})
+            if any(placed.values()):
+                result["placed_markets"] += 1
+        return result
 
     def reconcile_startup(self) -> Dict[str, Any]:
         """Startup reconciliation before any new BUY is placed.

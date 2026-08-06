@@ -438,115 +438,39 @@ def main():
                         # 继续执行，不中断主循环
                         last_orderbook_update = current_time
                 
-                # 4.3 定期重新扫描和筛选市场（完全重新选举模式）
+                # 4.3 定期重新扫描和筛选市场（差量更新模式）
                 if current_time - last_market_scan >= config.update_interval_seconds:
                     logger.info("=" * 60)
-                    logger.info("重新扫描和筛选市场（完全重新选举模式）...")
+                    logger.info("重新扫描和筛选市场（差量更新）...")
                     logger.info("=" * 60)
                     
                     try:
-                        # 清空待重新挂单的 token 列表（市场重新选举时，所有待重新挂单的 token 都应该清空）
-                        with order_manager.lock:
-                            pending_count = len(order_manager.pending_reorder_tokens)
-                            if pending_count > 0:
-                                logger.info(f"清空待重新挂单列表: {pending_count} 个 token")
-                                order_manager.pending_reorder_tokens.clear()
-                        
-                        # 第一步：获取当前所有活跃市场的ID（取消订单前）
-                        old_market_ids = set(order_manager.get_active_orders().keys())
-                        logger.info(f"当前活跃市场数: {len(old_market_ids)}")
-                        
-                        # 第二步：取消所有当前活跃市场的未成交挂单
-                        total_cancelled = 0
-                        if old_market_ids:
-                            logger.info(f"开始取消所有活跃市场的未成交挂单...")
-                            for market_id in old_market_ids:
-                                try:
-                                    cancelled_count = order_manager.cancel_market_orders(market_id)
-                                    total_cancelled += cancelled_count
-                                except Exception as e:
-                                    logger.error(f"取消市场 {market_id} 订单失败: {e}")
-                            logger.info(f"已取消 {total_cancelled} 个未成交挂单，涉及 {len(old_market_ids)} 个市场")
-                        else:
-                            logger.info("当前没有活跃市场，跳过取消订单步骤")
-                        
-                        # 第三步：重新获取当前活跃市场列表（取消订单后）
-                        # 重要：取消订单后，active_orders 已经被清空，需要重新获取
-                        current_market_ids = set(order_manager.get_active_orders().keys())
-                        logger.info(f"取消订单后，当前活跃市场数: {len(current_market_ids)}")
-                        
-                        # 第四步：扫描所有流动性奖励市场
+                        # 第一步：记录上一轮选择（独立于活跃订单集合）
+                        previous_market_ids = market_manager.update_selected_market_ids()
+                        logger.info(f"上一轮选择市场数: {len(previous_market_ids)}")
+
+                        # 第二步：扫描所有流动性奖励市场
                         all_markets = market_manager.scan_rewards_markets()
                         logger.info(f"扫描到 {len(all_markets)} 个有流动性奖励的市场")
                         
-                        # 第五步：筛选最优市场
+                        # 第三步：筛选最优市场
                         new_selected_markets = market_manager.filter_markets()
                         logger.info(f"筛选出 {len(new_selected_markets)} 个机会市场")
                         
-                        # 第六步：只为新市场挂单（排除仍在活跃列表中的市场）
-                        if new_selected_markets:
-                            # 获取新市场的ID集合
-                            new_market_ids = {m.get("market_id") for m in new_selected_markets}
-                            
-                            # 找出不在当前活跃市场列表中的新市场（使用取消订单后的列表）
-                            markets_to_place = [m for m in new_selected_markets if m.get("market_id") not in current_market_ids]
-                            
-                            if markets_to_place:
-                                logger.info(f"发现 {len(markets_to_place)} 个新机会市场，开始挂单...")
-                                logger.info(f"（{len(new_selected_markets) - len(markets_to_place)} 个市场已在活跃列表中，维持现状）")
-                                
-                                # 为新市场挂单（每个市场挂单前实时获取订单簿数据）
-                                new_orderbooks_dict = {}  # 备用数据源
-                                total_placed = 0
-                                
-                                for market in markets_to_place:
-                                    if not running:
-                                        break
-                                    
-                                    market_id = market.get("market_id")
-                                    logger.info(f"为新市场挂单: ID={market_id}")
-                                    
-                                    try:
-                                        # 每次挂单前实时获取该市场的订单簿数据（作为备用）
-                                        # place_market_orders 方法会强制实时获取，这里只是作为备用
-                                        market_orderbooks = api_client.get_markets_orderbooks([market], use_cache=False)
-                                        new_orderbooks_dict.update(market_orderbooks)
-                                        
-                                        # 挂单（place_market_orders 会强制实时获取最新数据）
-                                        results = order_manager.place_market_orders(market, new_orderbooks_dict)
-                                        success_count = sum(1 for v in results.values() if v)
-                                        total_count = len(results)
-                                        if success_count > 0:
-                                            total_placed += 1
-                                        logger.info(f"市场 {market_id} 挂单完成: {success_count}/{total_count} 成功")
-                                        
-                                        # 每挂完一个市场就检查一次所有已挂单市场的价格调整（防止信息滞后）
-                                        # 这样可以确保前面挂的订单在挂单过程中如果订单簿已经变化，能够及时调整
-                                        if success_count > 0:
-                                            logger.info(f"检查并调整所有已挂订单价格...")
-                                            try:
-                                                active_markets = []
-                                                for mid in order_manager.get_active_orders().keys():
-                                                    m = order_manager.market_data_cache.get(mid)
-                                                    if m:
-                                                        active_markets.append(m)
-                                                
-                                                if active_markets:
-                                                    adjusted_counts = order_manager.adjust_orders_to_reward_boundaries(active_markets)
-                                                    if adjusted_counts:
-                                                        total_adjusted = sum(adjusted_counts.values())
-                                                        logger.info(f"价格调整完成: 共调整 {total_adjusted} 个订单")
-                                            except Exception as e:
-                                                logger.warning(f"价格调整检查失败: {e}")
-                                    
-                                    except Exception as e:
-                                        logger.error(f"为新市场 {market_id} 挂单失败: {e}")
-                                
-                                logger.info(f"新市场挂单完成: 共为 {total_placed}/{len(markets_to_place)} 个市场成功挂单")
-                            else:
-                                logger.info("所有机会市场已在活跃列表中，无需重新挂单")
-                        else:
-                            logger.info("未筛选出任何机会市场")
+                        # 第四步：差量更新（retained 保留，removed 只撤 BUY，added 完整准入后挂单）
+                        new_market_ids = market_manager.get_selected_market_ids()
+                        refresh = order_manager.refresh_market_selection(
+                            previous_market_ids,
+                            new_market_ids,
+                            new_selected_markets,
+                        )
+                        logger.info(
+                            f"市场差量更新: retained={len(refresh['retained'])}, "
+                            f"removed={len(refresh['removed'])}, "
+                            f"added={len(refresh['added'])}, "
+                            f"取消 BUY={refresh['cancelled_buys']}, "
+                            f"新挂单市场={refresh['placed_markets']}"
+                        )
                         
                         last_market_scan = current_time
                     except Exception as e:

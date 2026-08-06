@@ -24,6 +24,8 @@ class MarketManager:
         self.api_client = api_client
         self.markets: List[Dict[str, Any]] = []
         self.selected_markets: List[Dict[str, Any]] = []
+        # 上一轮选择的市场 ID（用于差量重扫，不通过活跃订单集合推断）
+        self.previous_selected_market_ids: set = set()
         self._monotonic = time.monotonic
     
     def scan_rewards_markets(self) -> List[Dict[str, Any]]:
@@ -806,6 +808,15 @@ class MarketManager:
             筛选后的市场列表
         """
         return self.selected_markets
+
+    def get_selected_market_ids(self) -> set:
+        """当前选择的市场 ID 集合（独立记录，不依赖活跃订单）。"""
+        return {m.get("market_id") for m in self.selected_markets if m.get("market_id")}
+
+    def update_selected_market_ids(self) -> set:
+        """把当前选择记录为上一轮选择，并返回当前 ID 集合。"""
+        self.previous_selected_market_ids = self.get_selected_market_ids()
+        return self.previous_selected_market_ids
     
     def refresh_markets(self) -> List[Dict[str, Any]]:
         """
