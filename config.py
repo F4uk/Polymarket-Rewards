@@ -58,6 +58,68 @@ class Config:
         except (ValueError, TypeError):
             logger.warning(f"环境变量 {name} 不是有效的数值，使用默认值 {default}")
             return default
+
+    @classmethod
+    def _env_float_validated(
+        cls,
+        name: str,
+        default: float,
+        min_value: Optional[float] = None,
+        max_value: Optional[float] = None,
+    ) -> float:
+        """Parse a float config with range validation and safe fallback.
+
+        Invalid or out-of-range values fall back to ``default`` (never zero
+        unless zero is the explicit default).
+        """
+        r = cls._env_raw(name)
+        if r is None:
+            return default
+        try:
+            value = float(r)
+        except (ValueError, TypeError):
+            logger.warning(f"环境变量 {name} 不是有效的数值，使用默认值 {default}")
+            return default
+        if min_value is not None and value < min_value:
+            logger.warning(
+                f"环境变量 {name}={value} 低于下限 {min_value}，使用默认值 {default}"
+            )
+            return default
+        if max_value is not None and value > max_value:
+            logger.warning(
+                f"环境变量 {name}={value} 超过上限 {max_value}，使用默认值 {default}"
+            )
+            return default
+        return value
+
+    @classmethod
+    def _env_int_validated(
+        cls,
+        name: str,
+        default: int,
+        min_value: Optional[int] = None,
+        max_value: Optional[int] = None,
+    ) -> int:
+        """Parse an integer config with range validation and safe fallback."""
+        r = cls._env_raw(name)
+        if r is None:
+            return default
+        try:
+            value = int(float(r))
+        except (ValueError, TypeError):
+            logger.warning(f"环境变量 {name} 不是有效的整数，使用默认值 {default}")
+            return default
+        if min_value is not None and value < min_value:
+            logger.warning(
+                f"环境变量 {name}={value} 低于下限 {min_value}，使用默认值 {default}"
+            )
+            return default
+        if max_value is not None and value > max_value:
+            logger.warning(
+                f"环境变量 {name}={value} 超过上限 {max_value}，使用默认值 {default}"
+            )
+            return default
+        return value
     
     @classmethod
     def _env_int(cls, name: str, default: Optional[int]) -> Optional[int]:
@@ -110,6 +172,65 @@ class Config:
             "order_check_interval_seconds": self._env_float("ORDER_CHECK_INTERVAL_SECONDS", 30),
             "orderbook_update_interval_seconds": self._env_float("ORDERBOOK_UPDATE_INTERVAL_SECONDS", 5),
             "price_deviation_threshold_bps": self._env_float("PRICE_DEVIATION_THRESHOLD_BPS", 1),
+            # 订单簿新鲜度
+            "max_orderbook_age_seconds": self._env_float_validated(
+                "MAX_ORDERBOOK_AGE_SECONDS", 3.0, min_value=0.0
+            ),
+            # 撤挂迟滞
+            "min_quote_lifetime_seconds": self._env_float_validated(
+                "MIN_QUOTE_LIFETIME_SECONDS", 10.0, min_value=0.0
+            ),
+            "requote_min_ticks": self._env_int_validated(
+                "REQUOTE_MIN_TICKS", 2, min_value=0
+            ),
+            "requote_confirmations": self._env_int_validated(
+                "REQUOTE_CONFIRMATIONS", 2, min_value=1
+            ),
+            "requote_cooldown_seconds": self._env_float_validated(
+                "REQUOTE_COOLDOWN_SECONDS", 5.0, min_value=0.0
+            ),
+            # 清仓后重新入场
+            "post_fill_reentry_cooldown_seconds": self._env_float_validated(
+                "POST_FILL_REENTRY_COOLDOWN_SECONDS", 30.0, min_value=0.0
+            ),
+            "reward_boundary_inset_ticks": self._env_int_validated(
+                "REWARD_BOUNDARY_INSET_TICKS", 0, min_value=0
+            ),
+            # 分级库存退出
+            "exit_immediate_max_loss_ticks": self._env_int_validated(
+                "EXIT_IMMEDIATE_MAX_LOSS_TICKS", 1, min_value=0
+            ),
+            "exit_immediate_max_loss_bps": self._env_float_validated(
+                "EXIT_IMMEDIATE_MAX_LOSS_BPS", 300.0, min_value=0.0
+            ),
+            "exit_passive_wait_seconds": self._env_float_validated(
+                "EXIT_PASSIVE_WAIT_SECONDS", 15.0, min_value=0.0
+            ),
+            "exit_emergency_loss_ticks": self._env_int_validated(
+                "EXIT_EMERGENCY_LOSS_TICKS", 3, min_value=0
+            ),
+            "exit_emergency_loss_bps": self._env_float_validated(
+                "EXIT_EMERGENCY_LOSS_BPS", 1000.0, min_value=0.0
+            ),
+            "exit_max_hold_seconds": self._env_float_validated(
+                "EXIT_MAX_HOLD_SECONDS", 90.0, min_value=0.0
+            ),
+            # 退出能力与持仓确认
+            "min_exit_depth_multiplier": self._env_float_validated(
+                "MIN_EXIT_DEPTH_MULTIPLIER", 1.2, min_value=1.0
+            ),
+            "position_dust_size": self._env_float_validated(
+                "POSITION_DUST_SIZE", 0.1, min_value=0.0
+            ),
+            "position_change_confirmations": self._env_int_validated(
+                "POSITION_CHANGE_CONFIRMATIONS", 2, min_value=1
+            ),
+            "order_confirmation_timeout_seconds": self._env_float_validated(
+                "ORDER_CONFIRMATION_TIMEOUT_SECONDS", 5.0, min_value=0.0
+            ),
+            "order_confirmation_retry_seconds": self._env_float_validated(
+                "ORDER_CONFIRMATION_RETRY_SECONDS", 0.5, min_value=0.0
+            ),
             # 订单管理
             "orderbook_wait_timeout": self._env_float("ORDERBOOK_WAIT_TIMEOUT", 2.0),
             "order_retry_count": self._env_int("ORDER_RETRY_COUNT", 3),
@@ -139,7 +260,82 @@ class Config:
             "signature_type": self._env_int("SIGNATURE_TYPE", 1),
             "chain_id": self._env_int("CHAIN_ID", 137),
         }
+        self._validate_cross_field_constraints()
         logger.info("成功从环境变量加载配置")
+
+    def _validate_cross_field_constraints(self) -> None:
+        """Enforce documented relations between related config values.
+
+        Offending values are clamped to the constraint boundary with a warning
+        instead of being silently zeroed.
+        """
+        cfg = self.config
+
+        # confirmations 至少为 1
+        for key in ("requote_confirmations", "position_change_confirmations"):
+            if int(cfg.get(key, 1)) < 1:
+                logger.warning(f"配置项 {key} 小于 1，回退到 1")
+                cfg[key] = 1
+
+        # 深度倍数不小于 1
+        if float(cfg.get("min_exit_depth_multiplier", 1.2)) < 1.0:
+            logger.warning("配置项 min_exit_depth_multiplier 小于 1，回退到 1.0")
+            cfg["min_exit_depth_multiplier"] = 1.0
+
+        # 紧急亏损阈值不小于快速退出阈值
+        emergency_ticks = max(
+            int(cfg.get("exit_emergency_loss_ticks", 3)),
+            int(cfg.get("exit_immediate_max_loss_ticks", 1)),
+        )
+        if int(cfg.get("exit_emergency_loss_ticks", 3)) < int(
+            cfg.get("exit_immediate_max_loss_ticks", 1)
+        ):
+            logger.warning(
+                "配置项 exit_emergency_loss_ticks 小于 exit_immediate_max_loss_ticks，"
+                f"回退到 {emergency_ticks}"
+            )
+            cfg["exit_emergency_loss_ticks"] = emergency_ticks
+
+        emergency_bps = max(
+            float(cfg.get("exit_emergency_loss_bps", 1000.0)),
+            float(cfg.get("exit_immediate_max_loss_bps", 300.0)),
+        )
+        if float(cfg.get("exit_emergency_loss_bps", 1000.0)) < float(
+            cfg.get("exit_immediate_max_loss_bps", 300.0)
+        ):
+            logger.warning(
+                "配置项 exit_emergency_loss_bps 小于 exit_immediate_max_loss_bps，"
+                f"回退到 {emergency_bps}"
+            )
+            cfg["exit_emergency_loss_bps"] = emergency_bps
+
+        # 最大持仓时间不小于被动等待时间
+        max_hold = max(
+            float(cfg.get("exit_max_hold_seconds", 90.0)),
+            float(cfg.get("exit_passive_wait_seconds", 15.0)),
+        )
+        if float(cfg.get("exit_max_hold_seconds", 90.0)) < float(
+            cfg.get("exit_passive_wait_seconds", 15.0)
+        ):
+            logger.warning(
+                "配置项 exit_max_hold_seconds 小于 exit_passive_wait_seconds，"
+                f"回退到 {max_hold}"
+            )
+            cfg["exit_max_hold_seconds"] = max_hold
+
+        # 确认重试间隔大于零；确认超时不少于重试间隔
+        retry = float(cfg.get("order_confirmation_retry_seconds", 0.5))
+        if retry <= 0.0:
+            logger.warning("配置项 order_confirmation_retry_seconds 必须大于 0，回退到 0.5")
+            cfg["order_confirmation_retry_seconds"] = 0.5
+            retry = 0.5
+        timeout = float(cfg.get("order_confirmation_timeout_seconds", 5.0))
+        if timeout < retry:
+            logger.warning(
+                "配置项 order_confirmation_timeout_seconds 小于重试间隔，"
+                f"回退到 {retry}"
+            )
+            cfg["order_confirmation_timeout_seconds"] = retry
     
     def get(self, key: str, default: Any = None) -> Any:
         """
@@ -204,19 +400,98 @@ class Config:
         return self.get_int("update_interval_seconds", 300)
     
     @property
-    def order_check_interval_seconds(self) -> int:
-        """订单状态检查间隔（秒）"""
-        return self.get_int("order_check_interval_seconds", 30)
-    
-    @property
-    def orderbook_update_interval_seconds(self) -> int:
+    def orderbook_update_interval_seconds(self) -> float:
         """订单簿监控更新间隔（秒）"""
-        return self.get_int("orderbook_update_interval_seconds", 5)
+        return self.get_float("orderbook_update_interval_seconds", 5)
     
     @property
-    def price_deviation_threshold_bps(self) -> int:
+    def price_deviation_threshold_bps(self) -> float:
         """价格偏离阈值（基点）"""
-        return self.get_int("price_deviation_threshold_bps", 1)
+        return self.get_float("price_deviation_threshold_bps", 1)
+
+    @property
+    def order_check_interval_seconds(self) -> float:
+        """订单状态检查间隔（秒）"""
+        return self.get_float("order_check_interval_seconds", 30)
+
+    @property
+    def max_orderbook_age_seconds(self) -> float:
+        """订单簿最大允许年龄（秒）"""
+        return self.get_float("max_orderbook_age_seconds", 3.0)
+
+    @property
+    def min_quote_lifetime_seconds(self) -> float:
+        """普通重新报价前订单最短存活时间（秒）"""
+        return self.get_float("min_quote_lifetime_seconds", 10.0)
+
+    @property
+    def requote_min_ticks(self) -> int:
+        """普通重新报价的最小价格变化（tick）"""
+        return self.get_int("requote_min_ticks", 2)
+
+    @property
+    def requote_confirmations(self) -> int:
+        """普通重新报价需要的连续确认次数"""
+        return self.get_int("requote_confirmations", 2)
+
+    @property
+    def requote_cooldown_seconds(self) -> float:
+        """普通重新报价冷却（秒）"""
+        return self.get_float("requote_cooldown_seconds", 5.0)
+
+    @property
+    def post_fill_reentry_cooldown_seconds(self) -> float:
+        """清仓后重新买入冷却（秒）"""
+        return self.get_float("post_fill_reentry_cooldown_seconds", 30.0)
+
+    @property
+    def reward_boundary_inset_ticks(self) -> int:
+        """奖励边界向内缩进的 tick 数（0 = 不缩进）"""
+        return self.get_int("reward_boundary_inset_ticks", 0)
+
+    @property
+    def exit_immediate_max_loss_ticks(self) -> int:
+        return self.get_int("exit_immediate_max_loss_ticks", 1)
+
+    @property
+    def exit_immediate_max_loss_bps(self) -> float:
+        return self.get_float("exit_immediate_max_loss_bps", 300.0)
+
+    @property
+    def exit_passive_wait_seconds(self) -> float:
+        return self.get_float("exit_passive_wait_seconds", 15.0)
+
+    @property
+    def exit_emergency_loss_ticks(self) -> int:
+        return self.get_int("exit_emergency_loss_ticks", 3)
+
+    @property
+    def exit_emergency_loss_bps(self) -> float:
+        return self.get_float("exit_emergency_loss_bps", 1000.0)
+
+    @property
+    def exit_max_hold_seconds(self) -> float:
+        return self.get_float("exit_max_hold_seconds", 90.0)
+
+    @property
+    def min_exit_depth_multiplier(self) -> float:
+        return self.get_float("min_exit_depth_multiplier", 1.2)
+
+    @property
+    def position_dust_size(self) -> float:
+        return self.get_float("position_dust_size", 0.1)
+
+    @property
+    def position_change_confirmations(self) -> int:
+        return self.get_int("position_change_confirmations", 2)
+
+    @property
+    def order_confirmation_timeout_seconds(self) -> float:
+        return self.get_float("order_confirmation_timeout_seconds", 5.0)
+
+    @property
+    def order_confirmation_retry_seconds(self) -> float:
+        return self.get_float("order_confirmation_retry_seconds", 0.5)
     
     @property
     def orderbook_wait_timeout(self) -> float:

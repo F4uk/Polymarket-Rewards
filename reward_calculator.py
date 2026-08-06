@@ -5,6 +5,8 @@ Polymarket 奖励计算模块
 """
 from typing import Dict, List, Optional, Tuple, Any
 from logger import setup_logger
+from market_making_strategy import reward_spread_decimal
+from config import config
 
 logger = setup_logger("reward_calculator")
 
@@ -80,8 +82,13 @@ def calculate_q_one_q_two(
     q_two = 0.0
     
     # 计算奖励区间边界（用于过滤订单）
-    # 由于平台算法的原因，统一使用 (rewards_max_spread - 1) / 100
-    spread_decimal = (rewards_max_spread - 1) / 100  # 转换为小数
+    # 奖励区间半宽：美分转小数，唯一缩进来自配置（tick 默认为 0.01，与
+    # MarketMakingStrategy.calculate_reward_range 保持一致；不再使用固定减一美分）
+    spread_decimal = reward_spread_decimal(
+        rewards_max_spread,
+        config.reward_boundary_inset_ticks,
+        0.01,
+    )
     buy_price = max(0.0, mid_price - spread_decimal)
     sell_price = min(1.0, mid_price + spread_decimal)
     

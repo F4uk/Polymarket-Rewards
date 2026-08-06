@@ -304,21 +304,21 @@ class OrderManager:
         Returns:
             订单响应数据，如果下单失败返回 None
         """
+        side = side.upper()
+        if side not in ("BUY", "SELL"):
+            logger.error(f"未知的订单方向: {side}，拒绝下单")
+            return None
+
         # 检查敞口限制（卖出订单不受敞口限制，直接跳过检查）
-        if side.upper() != "SELL":
+        if side != "SELL":
             if not self.risk_manager.can_place_order(market_id, price, size, side):
                 logger.warning(f"市场 {market_id} 下单被风险限制拒绝")
                 return None
         
-        # 规范化价格：根据市场的最小价格步长四舍五入，并限制在有效范围内 [0.01, 1.0]
-        # 注意：买单不进行规范化（原始买二价或奖励下边界已经是符合规范的）
-        # 卖单需要进行规范化（确保是两位小数）
-        if side.upper() == "SELL":
-            # 卖单需要进行规范化，确保是两位小数
-            market = self.market_data_cache.get(market_id)
-            tick_size = self.strategy.get_order_price_min_tick_size(market)
-            price = self.strategy.normalize_price(price, tick_size)
-        # 买单不进行规范化，直接使用传入的价格（原始买二价或奖励下边界）
+        # 方向性取整：BUY 向下、SELL 向上（避免浮点误差，使用 Decimal）
+        market = self.market_data_cache.get(market_id)
+        tick_size = self.strategy.get_order_price_min_tick_size(market)
+        price = self.strategy.round_price_to_tick(price, tick_size, side)
         
         # 验证价格是否在有效范围内（双重检查）
         if price < 0.01 or price > 1.0:
@@ -339,7 +339,7 @@ class OrderManager:
                     token_id=token_id,
                     price=price,
                     size=size,
-                    side=BUY if side.upper() == "BUY" else SELL
+                    side=BUY if side == "BUY" else SELL
                 )
                 
                 order_options = self._build_order_options(market_id, token_id)

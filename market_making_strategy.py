@@ -2,7 +2,7 @@
 做市策略模块 - 基于流动性奖励的优化策略
 """
 from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 import math
 import time
 from typing import Dict, Any, Optional, Tuple
@@ -10,6 +10,25 @@ from config import config
 from logger import setup_logger
 
 logger = setup_logger("market_making_strategy")
+
+
+def reward_spread_decimal(
+    rewards_max_spread: float,
+    inset_ticks: int = 0,
+    tick_size: float = 0.01,
+) -> float:
+    """Convert rewards_max_spread (cents) to a decimal half-width.
+
+    The only inset is the configured tick-based boundary inset; there is no
+    unexplained fixed one-cent adjustment.
+    """
+    return round(
+        max(
+            0.0,
+            float(rewards_max_spread) / 100.0 - int(inset_ticks) * float(tick_size),
+        ),
+        10,
+    )
 
 
 @dataclass
@@ -245,7 +264,59 @@ class MarketMakingStrategy:
         mid_price = (normalized.best_bid + normalized.best_ask) / 2
         return mid_price
     
-    def normalize_price(self, price: float, order_price_min_tick_size: Optional[float] = None) -> float:
+    def round_price_to_tick(
+        self,
+        price: float,
+        order_price_min_tick_size: Optional[float] = None,
+        side: str = "BUY",
+    ) -> float:
+        """Round a price to the market tick size with an explicit side.
+
+        BUY rounds down (never raises execution risk), SELL rounds up (never
+        lowers the planned sell price). Unknown sides are rejected. The result
+        is clamped to the legal tick-aligned range and returned as a float.
+        """
+        if side not in ("BUY", "SELL"):
+            raise ValueError(f"未知的订单方向: {side}，必须为 BUY 或 SELL")
+
+        tick_size = 0.01
+        if order_price_min_tick_size is not None:
+            tick_size = float(order_price_min_tick_size)
+        if tick_size <= 0 or tick_size not in (0.1, 0.01, 0.001, 0.0001):
+            tick_size = 0.01
+
+        tick = Decimal(str(tick_size))
+        value = Decimal(str(price))
+        rounding = ROUND_FLOOR if side == "BUY" else ROUND_CEILING
+        steps = (value / tick).to_integral_value(rounding=rounding)
+        rounded = steps * tick
+
+        # 合法价格范围：最低为 0.01 与 tick 的较大者（保证 tick 对齐），最高为 1.0
+        lower = max(Decimal("0.01"), tick)
+        rounded = min(max(rounded, lower), Decimal("1.0"))
+        rounded = rounded.quantize(tick)
+        return float(rounded)
+
+    def immediate_exit_price(
+        self,
+        best_bid: float,
+        order_price_min_tick_size: Optional[float] = None,
+    ) -> float:
+        """Tick-aligned price that stays at or below the best bid.
+
+        Used only for SELL orders whose purpose is immediate execution; the
+        price is floored to the tick so it can never round above the best bid
+        and lose executability.
+        """
+        price = self.round_price_to_tick(best_bid, order_price_min_tick_size, "BUY")
+        return min(price, float(best_bid))
+
+    def normalize_price(
+        self,
+        price: float,
+        order_price_min_tick_size: Optional[float] = None,
+        side: str = "BUY",
+    ) -> float:
         """
         规范化价格：根据市场的最小价格步长（orderPriceMinTickSize）向下取整，并限制在有效范围内 [0.01, 1.0]
         
@@ -285,21 +356,7 @@ class MarketMakingStrategy:
                 else:
                     decimal_places = 0
         
-        # 向下取整到最小价格步长的倍数
-        # 例如：如果 tick_size = 0.01，价格 0.156 会变成 0.15
-        # 例如：如果 tick_size = 0.001，价格 0.1567 会变成 0.156
-        if tick_size > 0:
-            normalized = math.floor(float(price) / tick_size) * tick_size
-        else:
-            normalized = float(price)
-        
-        # 四舍五入到指定小数位数（避免浮点数精度问题）
-        normalized = round(normalized, decimal_places)
-        
-        # 限制在有效范围内 [0.01, 1.0]
-        normalized = max(0.01, min(1.0, normalized))
-        
-        return normalized
+        return self.round_price_to_tick(price, order_price_min_tick_size, side=side)
     
     def round_price(self, price: float) -> float:
         """
@@ -335,21 +392,22 @@ class MarketMakingStrategy:
             买单价格 = 中间价 - rewards_max_spread
             卖单价格 = 中间价 + rewards_max_spread
         """
-        # rewards_max_spread 是美分，需要转换为小数
-        # 例如 3.5 美分 = 0.035
-        spread = (rewards_max_spread - 1) / 100
+        # rewards_max_spread 是美分，需要转换为小数；唯一缩进来自配置的 tick 数
+        tick_size = self.get_order_price_min_tick_size(market)
+        spread = reward_spread_decimal(
+            rewards_max_spread,
+            config.reward_boundary_inset_ticks,
+            tick_size,
+        )
         
         # 买单价格 = 中间价 - rewards_max_spread
         buy_price = mid_price - spread
         # 卖单价格 = 中间价 + rewards_max_spread
         sell_price = mid_price + spread
         
-        # 获取市场的最小价格步长
-        tick_size = self.get_order_price_min_tick_size(market)
-        
-        # 规范化价格（根据市场的最小价格步长四舍五入，并限制在有效范围内 [0.01, 1.0]）
-        buy_price = self.normalize_price(buy_price, tick_size)
-        sell_price = self.normalize_price(sell_price, tick_size)
+        # 方向性取整：BUY 向下、SELL 向上
+        buy_price = self.round_price_to_tick(buy_price, tick_size, "BUY")
+        sell_price = self.round_price_to_tick(sell_price, tick_size, "SELL")
         
         return buy_price, sell_price
     
@@ -491,8 +549,11 @@ class MarketMakingStrategy:
             profit = min_profit_margin_bps / 10000  # 基点转小数
             sell_price = base_price + profit
         
-        # 规范化价格（根据市场的最小价格步长四舍五入，并限制在有效范围内 [0.01, 1.0]）
-        sell_price = self.normalize_price(sell_price, tick_size)
+        # 使用买一价时保持可成交（不得因取整高于买一价）；否则被动卖出向上取整
+        if best_bid_price is not None and sell_price == best_bid_price:
+            sell_price = self.immediate_exit_price(best_bid_price, tick_size)
+        else:
+            sell_price = self.round_price_to_tick(sell_price, tick_size, "SELL")
         
         logger.debug(
             f"对冲卖出价计算: 买入价={buy_price:.2f}, "
@@ -565,7 +626,8 @@ class MarketMakingStrategy:
         
         # 如果买二价 < buy_price（奖励下边界），返回 buy_price（奖励下边界）
         # 因为使用奖励下边界挂单后，买二价在我们后面，我们就是买二价
-        return buy_price
+        tick_size = self.infer_tick_size_from_orderbook(orderbook)
+        return self.round_price_to_tick(buy_price, tick_size, "BUY")
     
     def can_place_buy_order_safely(
         self,
