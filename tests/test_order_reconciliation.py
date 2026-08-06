@@ -85,7 +85,8 @@ def test_timeout_moves_order_to_unknown_then_reconciles(fake_clock):
     assert om.active_orders["market-1"][TOKEN_A]["BUY"]["status"] == "UNKNOWN"
     assert om.metrics["unknown_order_count"] >= 1
 
-    # 对账：无订单、无成交、无持仓 -> FAILED
+    # 对账：无订单、无成交、无持仓（可靠空结果）-> FAILED
+    om.get_positions = lambda **kwargs: []
     om._reconcile_unknown_orders()
     assert "BUY" not in om.active_orders.get("market-1", {}).get(TOKEN_A, {})
 

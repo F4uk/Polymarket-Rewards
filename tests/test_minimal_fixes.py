@@ -142,6 +142,7 @@ def test_startup_open_orders_failure_blocks_new_buy(fake_clock):
     assert len([c for c in clob.post_order_calls if c["order"].side == "BUY"]) == 0
 
     clob.fail_open_orders = False
+    om.get_positions = lambda **kwargs: []
     assert om.retry_startup_reconciliation() is True
     assert om.startup_open_orders_blocked is False
 
@@ -210,3 +211,72 @@ def test_pending_reorder_with_stale_book_does_not_buy(fake_clock):
     om.adjust_orders_to_reward_boundaries([_market()])
     assert len([c for c in clob.post_order_calls if c["order"].side == "BUY"]) == 0
     assert TOKEN_A in om.pending_reorder_tokens
+
+
+def test_replacement_sell_resets_processed_and_flat_no_third_sell(fake_clock):
+    om, clob = _make_om(fake_clock, {TOKEN_A: _book(fake_clock, best_bid=0.56)})
+    assert om._handle_buy_fill("market-1", TOKEN_A, 0.60, 100.0)
+    state = om.inventory_exits[TOKEN_A]
+    old_sell_id = state["sell_order_id"]
+
+    clob.fill_order(old_sell_id, 40.0)
+    om.check_inventory_exits()
+    assert state["sold_size"] == 40.0
+    assert state["processed_sell_size"] == 40.0
+    assert state["remaining_size"] == 60.0
+
+    # 取消剩余部分并确认 -> 替换 SELL 只挂剩余 60
+    assert om.cancel_order(old_sell_id)
+    om.check_inventory_exits()
+    assert state["sold_size"] == 40.0
+    assert state["processed_sell_size"] == 0.0  # 新订单从 0 开始累计
+    new_sell_id = state["sell_order_id"]
+    assert new_sell_id is not None and new_sell_id != old_sell_id
+
+    # 替换 SELL 成交剩余 60 -> 最终 FLAT，且不得出现第三张 SELL
+    clob.fill_order(new_sell_id, 60.0)
+    om.check_inventory_exits()
+    assert state["state"] == "FLAT"
+    assert state["remaining_size"] == 0.0
+    sells = [c for c in clob.post_order_calls if c["order"].side == "SELL"]
+    assert len(sells) == 2
+
+
+def test_retry_startup_full_reconcile_positions_failure_keeps_block(fake_clock):
+    om, clob = _make_om(fake_clock)
+
+    def _fail_positions(**kwargs):
+        raise RuntimeError("simulated positions failure")
+
+    om.get_positions = _fail_positions
+    result = om.reconcile_startup()
+    assert result["open_orders_query_ok"] is True
+    assert result["positions_query_ok"] is False
+    assert om.startup_open_orders_blocked is True
+
+    # 重试必须重新完成完整启动对账；positions 仍失败 -> 保持阻断
+    assert om.retry_startup_reconciliation() is False
+    assert om.startup_open_orders_blocked is True
+
+    om.get_positions = lambda **kwargs: []
+    assert om.retry_startup_reconciliation() is True
+    assert om.startup_open_orders_blocked is False
+
+
+def test_startup_positions_empty_vs_failure_distinct(fake_clock):
+    om, clob = _make_om(fake_clock)
+    om.get_positions = lambda **kwargs: []
+    result = om.reconcile_startup()
+    assert result["positions_query_ok"] is True
+    assert om.startup_open_orders_blocked is False
+
+    om2, clob2 = _make_om(fake_clock)
+
+    def _fail_positions(**kwargs):
+        raise RuntimeError("simulated positions failure")
+
+    om2.get_positions = _fail_positions
+    result2 = om2.reconcile_startup()
+    assert result2["positions_query_ok"] is False
+    assert om2.startup_open_orders_blocked is True
+    assert result2["positions_imported"] == 0

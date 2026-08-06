@@ -213,7 +213,8 @@ class OrderManager:
         size_threshold: float = 1.0,
         limit: int = 100,
         sort_by: str = "TOKENS",
-        sort_direction: str = "DESC"
+        sort_direction: str = "DESC",
+        _strict: bool = False
     ) -> List[Dict[str, Any]]:
         """
         获取用户持仓信息
@@ -233,6 +234,8 @@ class OrderManager:
         
         if not user_address:
             logger.error("无法获取用户地址，请设置FUNDER_ADDRESS环境变量")
+            if _strict:
+                raise ValueError("无法获取用户地址（严格模式）")
             return []
         
         data_api_url = os.getenv("DATA_API_URL", "https://data-api.polymarket.com")
@@ -257,10 +260,30 @@ class OrderManager:
                 # 兼容可能的字典格式
                 return data.get("data", [])
             else:
+                if _strict:
+                    raise ValueError("持仓响应格式异常（严格模式）")
                 return []
         except requests.exceptions.RequestException as e:
             logger.error(f"获取持仓信息时发生错误: {e}")
+            if _strict:
+                raise
             return []
+
+    def _get_positions_strict(
+        self,
+        size_threshold: float = 0.1,
+        limit: int = 1000,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """严格持仓查询：失败返回 None（与成功空结果区分）。"""
+        try:
+            return self.get_positions(
+                size_threshold=size_threshold,
+                limit=limit,
+                _strict=True,
+            )
+        except Exception as e:
+            logger.warning(f"严格持仓查询失败: {e}")
+            return None
     
     def _validate_orderbook(self, orderbook: Dict[str, Any], token_id: str) -> bool:
         """
@@ -556,6 +579,8 @@ class OrderManager:
                 if current is not None:
                     current["sell_order_id"] = order_id
                     current["sell_order_status"] = "PENDING_CONFIRMATION"
+                    # 新订单的已处理成交从 0 开始；sold_size 保持跨订单累计
+                    current["processed_sell_size"] = 0.0
                     current["last_action_at"] = self._monotonic()
             if purpose == "FAST_EXIT":
                 self.metrics["fast_exit_count"] += 1
@@ -949,10 +974,9 @@ class OrderManager:
             logger.warning(f"UNKNOWN 对账：open orders 查询失败，保持 UNKNOWN: {e}")
             open_orders_ok = False
             open_ids = set()
-        try:
-            positions = self.get_positions(size_threshold=0.1, limit=1000)
-        except Exception as e:
-            logger.warning(f"UNKNOWN 对账：positions 查询失败，保持 UNKNOWN: {e}")
+        positions = self._get_positions_strict(size_threshold=0.1, limit=1000)
+        if positions is None:
+            logger.warning("UNKNOWN 对账：positions 查询失败，保持 UNKNOWN")
             positions_ok = False
             positions = []
         positions_by_token = {
@@ -3571,39 +3595,47 @@ class OrderManager:
                     }
                 result["sells_imported"] += 1
 
-        try:
-            positions = self.get_positions(size_threshold=0.1, limit=1000)
-            result["positions_query_ok"] = True
-        except Exception as e:
-            logger.warning(f"启动对账：获取持仓失败: {e}")
-            positions = []
+        positions = self._get_positions_strict(size_threshold=0.1, limit=1000)
+        if positions is None:
             result["positions_query_ok"] = False
-            logger.info("启动对账：positions 查询失败，不视为空持仓")
-        for position in positions:
-            token_id = position.get("asset")
-            size = float(position.get("size", 0) or 0)
-            if not token_id or size <= config.position_dust_size:
-                continue
-            market_id = self._get_market_id_from_token_id(token_id) or "unknown"
-            with self.lock:
-                if token_id not in self.inventory_exits:
-                    self.inventory_exits[token_id] = self._new_inventory_state(
-                        market_id,
-                        token_id,
-                        float(position.get("avgPrice", 0) or 0.50),
-                        size,
-                    )
-                    result["positions_imported"] += 1
+            # 查询失败与成功空结果区分：失败时保持新 BUY 阻断
+            self.startup_open_orders_blocked = True
+            logger.warning("启动对账：positions 查询失败，保持新 BUY 阻断")
+        else:
+            result["positions_query_ok"] = True
+            for position in positions:
+                token_id = position.get("asset")
+                size = float(position.get("size", 0) or 0)
+                if not token_id or size <= config.position_dust_size:
+                    continue
+                market_id = self._get_market_id_from_token_id(token_id) or "unknown"
+                with self.lock:
+                    if token_id not in self.inventory_exits:
+                        self.inventory_exits[token_id] = self._new_inventory_state(
+                            market_id,
+                            token_id,
+                            float(position.get("avgPrice", 0) or 0.50),
+                            size,
+                        )
+                        result["positions_imported"] += 1
 
         logger.info(f"启动对账完成: {result}")
         return result
 
     def retry_startup_reconciliation(self) -> bool:
-        """重试启动时的 open orders 查询；成功后解除新 BUY 阻断。"""
+        """重新执行完整启动对账；全部成功后才解除新 BUY 阻断。"""
         try:
-            self.clob_client.get_open_orders(OpenOrderParams())
+            result = self.reconcile_startup()
         except Exception as e:
             logger.warning(f"重试启动对账失败，继续阻断新 BUY: {e}")
+            self.startup_open_orders_blocked = True
+            return False
+        if not (
+            result.get("open_orders_query_ok")
+            and result.get("positions_query_ok")
+        ):
+            self.startup_open_orders_blocked = True
+            logger.warning("重试启动对账未全部成功，继续阻断新 BUY")
             return False
         self.startup_open_orders_blocked = False
         logger.info("重试启动对账成功，解除新 BUY 阻断")
