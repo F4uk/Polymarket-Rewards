@@ -187,18 +187,20 @@ def main():
         
         # 2. WebSocket 服务已移除，现在使用 HTTP 接口和 Redis 获取订单簿数据
         
-        # 2.5. 启动时取消所有现有的购买挂单（做市策略要求）
+        # 2.5. 启动对账：先处理现有订单和持仓，再扫描并挂新 BUY
         logger.info("=" * 60)
-        logger.info("取消所有现有的购买挂单...")
+        logger.info("启动对账（现有订单/持仓优先于新买单）...")
         logger.info("=" * 60)
         try:
-            cancelled_count = order_manager.cancel_all_buy_orders()
-            if cancelled_count > 0:
-                logger.info(f"已取消 {cancelled_count} 个现有的购买挂单")
-            else:
-                logger.info("没有发现现有的购买挂单")
+            startup_reconciliation = order_manager.reconcile_startup()
+            logger.info(
+                f"启动对账结果: 活跃订单={startup_reconciliation['open_orders']}, "
+                f"取消遗留买单={startup_reconciliation['buys_cancelled']}, "
+                f"导入卖单={startup_reconciliation['sells_imported']}, "
+                f"导入持仓={startup_reconciliation['positions_imported']}"
+            )
         except Exception as e:
-            logger.warning(f"取消现有购买挂单时发生错误: {e}，继续运行")
+            logger.warning(f"启动对账时发生错误: {e}，继续运行")
         
         # 3. 初始市场扫描和筛选
         logger.info("=" * 60)
@@ -355,31 +357,23 @@ def main():
                         
                         # 原有的订单检查逻辑（用于补单和清理）
                         filled_orders_by_market = order_manager.check_orders()
-                        
+
                         if filled_orders_by_market:
-                            # 处理成交的订单：补单和对冲卖出
-                            for market_id, filled_orders in filled_orders_by_market.items():
-                                # 从缓存中获取市场数据
-                                market = order_manager.market_data_cache.get(market_id)
-                                
-                                if market:
-                                    rewards_max_spread = market.get("rewards_max_spread", 0)
-                                    
-                                    for filled_order in filled_orders:
-                                        token_id = filled_order.get("token_id")
-                                        side = filled_order.get("side")
-                                        
-                                        # 补单（重新挂单）
-                                        if rewards_max_spread:
-                                            try:
-                                                order_manager.replace_filled_order(
-                                                    market_id=market_id,
-                                                    token_id=token_id,
-                                                    side=side,
-                                                    rewards_max_spread=rewards_max_spread
-                                                )
-                                            except Exception as e:
-                                                logger.error(f"补单失败: {e}")
+                            logger.info(
+                                f"检测到成交：进入库存退出，不立即补买 "
+                                f"({sum(len(v) for v in filled_orders_by_market.values())} 个订单)"
+                            )
+
+                        # 库存清仓并冷却结束后，重新执行完整准入后恢复 BUY
+                        try:
+                            reentry_results = order_manager.maybe_reenter_markets(
+                                market_manager.get_selected_markets()
+                            )
+                            reentered = sum(1 for v in reentry_results.values() if v)
+                            if reentered > 0:
+                                logger.info(f"重新准入并恢复 BUY: {reentered} 个 token")
+                        except Exception as e:
+                            logger.warning(f"重新入场检查失败: {e}")
                         
                         # 显示订单统计
                         stats = order_manager.get_order_statistics()

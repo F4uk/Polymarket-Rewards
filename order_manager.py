@@ -2215,66 +2215,58 @@ class OrderManager:
                 order_info = partial_order["order_info"]
                 filled = partial_order["filled"]
                 original_size = partial_order["original_size"]
-                
-                # 取消剩余部分（取消整个订单）
+
+                # 先处理新增成交差额（幂等；即使取消失败也不能漏掉新成交）
+                if side == "BUY" and filled > 0:
+                    with self.lock:
+                        filled_order_info = {
+                            "market_id": market_id,
+                            "token_id": token_id,
+                            "side": side,
+                            "order_id": order_id,
+                            "price": order_info.get("price"),
+                            "size": original_size,
+                            "filled_size": filled,
+                            "exposure": order_info.get("exposure", 0),
+                            "status": "partially_filled",
+                        }
+                        if market_id not in self.filled_buy_orders:
+                            self.filled_buy_orders[market_id] = []
+                        self.filled_buy_orders[market_id].append(filled_order_info)
+
+                    self.risk_manager.remove_exposure(market_id, order_info.get("exposure", 0))
+                    self.risk_manager.add_filled_order_exposure(
+                        market_id,
+                        order_info.get("price", 0),
+                        filled,
+                    )
+
+                    try:
+                        self._handle_buy_fill(
+                            market_id=market_id,
+                            token_id=token_id,
+                            buy_price=order_info.get("price"),
+                            filled_size=filled,
+                        )
+                    except Exception as e:
+                        logger.error(f"部分成交买单进入库存退出时发生错误: {e}")
+                else:
+                    self.risk_manager.remove_exposure(market_id, order_info.get("exposure", 0))
+
+                # 取消剩余部分；失败时保留订单记录并对账（不得假设已取消）
                 if self.cancel_order(order_id):
                     logger.info(f"已取消部分成交订单的剩余部分: 订单ID={order_id}")
-                    
-                    # 在锁内更新活跃订单（风险敞口更新在锁外执行，避免死锁）
                     with self.lock:
-                        # 从活跃订单中移除
-                        if market_id in self.active_orders and token_id in self.active_orders[market_id] and side in self.active_orders[market_id][token_id]:
+                        if (
+                            market_id in self.active_orders
+                            and token_id in self.active_orders[market_id]
+                            and side in self.active_orders[market_id][token_id]
+                        ):
                             del self.active_orders[market_id][token_id][side]
-                    
-                    # 在锁外更新风险敞口（避免死锁）
-                    if side == "BUY" and filled > 0:
-                        # 买单部分成交：移除整个挂单的敞口，添加已成交部分的敞口
-                        self.risk_manager.remove_exposure(market_id, order_info.get("exposure", 0))
-                        self.risk_manager.add_filled_order_exposure(
-                            market_id,
-                            order_info.get("price", 0),
-                            filled
-                        )
-                    else:
-                        # 非买单或未成交，移除挂单敞口
-                        self.risk_manager.remove_exposure(market_id, order_info.get("exposure", 0))
-                    
-                    # 如果是买单部分成交，需要处理已成交部分（在锁外执行，避免死锁）
-                    if side == "BUY" and filled > 0:
-                        # 记录已成交的买单，用于对冲卖出
-                        with self.lock:
-                            filled_order_info = {
-                                "market_id": market_id,
-                                "token_id": token_id,
-                                "side": side,
-                                "order_id": order_id,
-                                "price": order_info.get("price"),
-                                "size": original_size,
-                                "filled_size": filled,
-                                "exposure": order_info.get("exposure", 0),
-                                "status": "partially_filled"
-                            }
-                            if market_id not in self.filled_buy_orders:
-                                self.filled_buy_orders[market_id] = []
-                            self.filled_buy_orders[market_id].append(filled_order_info)
-                        
-                        # 进入分级库存退出（使用已成交份额）
-                        try:
-                            hedge_result = self._handle_buy_fill(
-                                market_id=market_id,
-                                token_id=token_id,
-                                buy_price=order_info.get("price"),
-                                filled_size=filled
-                            )
-                            if hedge_result:
-                                logger.info(f"部分成交买单对冲卖出成功: 市场={market_id}, token={token_id[:20]}..., 已成交份额={filled}")
-                            else:
-                                logger.warning(f"部分成交买单对冲卖出失败: 市场={market_id}, token={token_id[:20]}...")
-                        except Exception as e:
-                            logger.error(f"部分成交买单对冲卖出时发生错误: {e}")
-                    
                 else:
-                    logger.error(f"取消部分成交订单失败: 订单ID={order_id}")
+                    logger.error(
+                        f"取消部分成交订单失败，保留订单继续对账: 订单ID={order_id}"
+                    )
             
             if filled_orders_by_market:
                 total_filled = sum(len(orders) for orders in filled_orders_by_market.values())
@@ -3381,6 +3373,156 @@ class OrderManager:
             logger.error(f"取消所有购买挂单失败: {e}")
         
         return cancelled_count
+
+    def reconcile_startup(self) -> Dict[str, Any]:
+        """Startup reconciliation before any new BUY is placed.
+
+        1. Query existing open orders.
+        2. Cancel legacy/non-essential BUY orders.
+        3. Import existing SELL orders into active order tracking.
+        4. Import existing positions into inventory exit management.
+        """
+        result: Dict[str, Any] = {
+            "open_orders": 0,
+            "buys_cancelled": 0,
+            "sells_imported": 0,
+            "positions_imported": 0,
+        }
+        try:
+            open_orders = self.clob_client.get_open_orders(OpenOrderParams()) or []
+        except Exception as e:
+            logger.error(f"启动对账：获取活跃订单失败: {e}")
+            open_orders = []
+        result["open_orders"] = len(open_orders)
+
+        for order in open_orders:
+            order_id = order.get("id")
+            if not order_id:
+                continue
+            side = str(order.get("side", "")).upper()
+            token_id = order.get("token_id") or order.get("asset_id")
+            price = float(order.get("price", 0) or 0)
+            size = float(order.get("size", 0) or 0)
+
+            if side == "BUY":
+                try:
+                    self.clob_client.cancel_order(OrderPayload(orderID=order_id))
+                    result["buys_cancelled"] += 1
+                    logger.info(f"启动对账：取消遗留 BUY {order_id}")
+                except Exception as e:
+                    logger.warning(f"启动对账：取消遗留 BUY 失败 {order_id}: {e}")
+            elif side == "SELL" and token_id:
+                market_id = self._get_market_id_from_token_id(token_id) or "unknown"
+                with self.lock:
+                    self.active_orders.setdefault(market_id, {}).setdefault(
+                        token_id, {}
+                    )["SELL"] = {
+                        "order_id": order_id,
+                        "token_id": token_id,
+                        "side": "SELL",
+                        "price": price,
+                        "size": size,
+                        "exposure": 0.0,
+                        "created_at": self._now(),
+                        "submitted_at": self._now(),
+                        "status": "LIVE",
+                        "purpose": "RECONCILED_EXIT",
+                        "generation": 0,
+                        "response": {"status": "live"},
+                    }
+                result["sells_imported"] += 1
+
+        try:
+            positions = self.get_positions(size_threshold=0.1, limit=1000)
+        except Exception as e:
+            logger.warning(f"启动对账：获取持仓失败: {e}")
+            positions = []
+        for position in positions:
+            token_id = position.get("asset")
+            size = float(position.get("size", 0) or 0)
+            if not token_id or size <= config.position_dust_size:
+                continue
+            market_id = self._get_market_id_from_token_id(token_id) or "unknown"
+            with self.lock:
+                if token_id not in self.inventory_exits:
+                    self.inventory_exits[token_id] = self._new_inventory_state(
+                        market_id,
+                        token_id,
+                        float(position.get("avgPrice", 0) or 0.50),
+                        size,
+                    )
+                    result["positions_imported"] += 1
+
+        logger.info(f"启动对账完成: {result}")
+        return result
+
+    def maybe_reenter_markets(
+        self,
+        markets: List[Dict[str, Any]],
+    ) -> Dict[str, bool]:
+        """Re-enter tokens whose inventory is flat and cooldown has expired.
+
+        Every reentry runs the full market-entry gate on a fresh book.
+        """
+        results: Dict[str, bool] = {}
+        for market in markets:
+            market_id = market.get("market_id")
+            rewards_max_spread = market.get("rewards_max_spread", 0)
+            if not market_id or not rewards_max_spread:
+                continue
+            self.market_data_cache[market_id] = market
+            order_size = self.strategy.calculate_order_size(market)
+            for token in market.get("tokens", []):
+                token_id = token.get("token_id")
+                if not token_id:
+                    continue
+                results[token_id] = False
+                with self.lock:
+                    has_buy = (
+                        market_id in self.active_orders
+                        and token_id in self.active_orders[market_id]
+                        and "BUY" in self.active_orders[market_id][token_id]
+                    )
+                if has_buy:
+                    continue
+                if self.has_inventory_or_pending_exit(token_id):
+                    self.metrics["blocked_reentry_count"] += 1
+                    continue
+
+                orderbook = self._get_orderbook(token_id)
+                if not orderbook:
+                    continue
+                entry = self.strategy.evaluate_token_entry(
+                    token_id,
+                    orderbook,
+                    market=market,
+                    order_size=order_size,
+                    now_monotonic=self._monotonic(),
+                )
+                if not entry.accepted:
+                    continue
+                prices = self.strategy.calculate_order_prices(
+                    orderbook, rewards_max_spread, market=market
+                )
+                if not prices:
+                    continue
+                actual = self.strategy.calculate_actual_buy_price(
+                    orderbook, prices["buy_price"]
+                )
+                if actual is None:
+                    continue
+                result = self.place_order(
+                    market_id=market_id,
+                    token_id=token_id,
+                    side="BUY",
+                    price=actual,
+                    size=order_size,
+                    purpose="REWARD_BUY",
+                )
+                results[token_id] = result is not None
+                if result:
+                    self.metrics["buys_placed"] += 1
+        return results
     
     def get_active_orders(self, market_id: Optional[str] = None) -> Dict[str, Any]:
         """
