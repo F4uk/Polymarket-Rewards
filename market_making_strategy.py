@@ -1,12 +1,130 @@
 """
 做市策略模块 - 基于流动性奖励的优化策略
 """
+from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 import math
+import time
 from typing import Dict, Any, Optional, Tuple
 from config import config
 from logger import setup_logger
 
 logger = setup_logger("market_making_strategy")
+
+
+@dataclass
+class NormalizedOrderbook:
+    """Order-independent standardized view of one token orderbook."""
+
+    normalized_bids: list = field(default_factory=list)
+    normalized_asks: list = field(default_factory=list)
+    best_bid: Optional[float] = None
+    best_ask: Optional[float] = None
+    second_bid: Optional[float] = None
+    is_empty: bool = True
+    is_one_sided: bool = False
+    is_crossed: bool = False
+    received_at: Optional[float] = None
+    age_seconds: Optional[float] = None
+    invalid_rows: int = 0
+
+
+def _aggregate_levels(levels: Optional[list]) -> Tuple[list, int]:
+    """Aggregate raw orderbook levels by exact price, returning sorted floats.
+
+    Unparseable prices, out-of-range prices, and non-positive sizes are ignored.
+    """
+    aggregated: Dict[Decimal, Decimal] = {}
+    invalid = 0
+    for level in levels or []:
+        try:
+            price = Decimal(str(level.get("price")))
+            size = Decimal(str(level.get("size")))
+        except (InvalidOperation, TypeError, ValueError):
+            invalid += 1
+            continue
+        if not price.is_finite() or not size.is_finite():
+            invalid += 1
+            continue
+        if price < 0 or price > 1 or size <= 0:
+            invalid += 1
+            continue
+        aggregated[price] = aggregated.get(price, Decimal(0)) + size
+    return [
+        (float(price), float(size))
+        for price, size in sorted(aggregated.items(), key=lambda kv: kv[0])
+    ], invalid
+
+
+def normalize_orderbook(
+    orderbook: Optional[Dict[str, Any]],
+    now_monotonic: Optional[float] = None,
+) -> NormalizedOrderbook:
+    """Single orderbook standardization entry point.
+
+    Produces sorted aggregated price levels, best/second prices, book health
+    flags, and a monotonic age. The caller-provided list is never mutated.
+
+    Args:
+        orderbook: raw orderbook dict with "bids"/"asks" lists.
+        now_monotonic: monotonic clock value; defaults to time.monotonic().
+
+    Returns:
+        NormalizedOrderbook.
+    """
+    if now_monotonic is None:
+        now_monotonic = time.monotonic()
+    if not orderbook:
+        return NormalizedOrderbook(
+            received_at=None,
+            age_seconds=None,
+        )
+
+    raw_bids = orderbook.get("bids", [])
+    raw_asks = orderbook.get("asks", [])
+    bids_asc, invalid_bids = _aggregate_levels(raw_bids)
+    asks_asc, invalid_asks = _aggregate_levels(raw_asks)
+
+    normalized_bids = list(reversed(bids_asc))  # price high -> low
+    normalized_asks = asks_asc  # price low -> high
+
+    best_bid = normalized_bids[0][0] if normalized_bids else None
+    best_ask = normalized_asks[0][0] if normalized_asks else None
+
+    second_bid = None
+    if len(normalized_bids) >= 2:
+        # normalized_bids is price-desc and aggregated, so index 1 is a
+        # strictly lower distinct price by construction.
+        second_bid = normalized_bids[1][0]
+
+    received_at = orderbook.get("_received_at")
+    if received_at is None:
+        received_at = orderbook.get("received_at")
+    age_seconds = None
+    if received_at is not None and now_monotonic is not None:
+        age_seconds = max(0.0, float(now_monotonic) - float(received_at))
+
+    is_empty = not normalized_bids and not normalized_asks
+    is_one_sided = (not normalized_bids) != (not normalized_asks)
+    is_crossed = (
+        best_bid is not None
+        and best_ask is not None
+        and best_bid >= best_ask
+    )
+
+    return NormalizedOrderbook(
+        normalized_bids=normalized_bids,
+        normalized_asks=normalized_asks,
+        best_bid=best_bid,
+        best_ask=best_ask,
+        second_bid=second_bid,
+        is_empty=is_empty,
+        is_one_sided=is_one_sided,
+        is_crossed=is_crossed,
+        received_at=received_at,
+        age_seconds=age_seconds,
+        invalid_rows=invalid_bids + invalid_asks,
+    )
 
 
 class MarketMakingStrategy:
@@ -75,26 +193,14 @@ class MarketMakingStrategy:
         Returns:
             推断出的 tick_size，如果无法推断则返回 0.01（默认值）
         """
-        bids = orderbook.get("bids", [])
-        asks = orderbook.get("asks", [])
+        normalized = normalize_orderbook(orderbook)
         
         # 收集所有价格，检查小数位数
         all_prices = []
-        for bid in bids[:10]:  # 只检查前10个，避免性能问题
-            price = bid.get("price")
-            if price:
-                try:
-                    all_prices.append(float(price))
-                except (ValueError, TypeError):
-                    continue
-        
-        for ask in asks[:10]:  # 只检查前10个
-            price = ask.get("price")
-            if price:
-                try:
-                    all_prices.append(float(price))
-                except (ValueError, TypeError):
-                    continue
+        for price, _ in normalized.normalized_bids[:10]:
+            all_prices.append(price)
+        for price, _ in normalized.normalized_asks[:10]:
+            all_prices.append(price)
         
         if not all_prices:
             return 0.01  # 默认值
@@ -128,21 +234,15 @@ class MarketMakingStrategy:
         Returns:
             中间价格，如果无法计算则返回 None
         """
-        bids = orderbook.get("bids", [])
-        asks = orderbook.get("asks", [])
-        
-        if not bids or not asks:
+        normalized = normalize_orderbook(orderbook)
+
+        if normalized.is_empty or normalized.is_one_sided:
             return None
-        
-        # best_bid = 最高买价（bids[-1]，按价格降序排列）
-        # best_ask = 最低卖价（asks[-1]，按价格升序排列）
-        best_bid = float(bids[-1].get("price", 0))
-        best_ask = float(asks[-1].get("price", 0))
-        
-        if best_bid <= 0 or best_ask <= 0:
+
+        if normalized.best_bid is None or normalized.best_ask is None:
             return None
-        
-        mid_price = (best_bid + best_ask) / 2
+
+        mid_price = (normalized.best_bid + normalized.best_ask) / 2
         return mid_price
     
     def normalize_price(self, price: float, order_price_min_tick_size: Optional[float] = None) -> float:
@@ -446,25 +546,15 @@ class MarketMakingStrategy:
         Returns:
             实际挂单价格，如果无法计算（只有买一价）则返回 None
         """
-        bids = orderbook.get("bids", [])
-        
-        if not bids:
+        normalized = normalize_orderbook(orderbook)
+
+        if not normalized.normalized_bids:
             return None
-        
-        # 获取买一价（最高买价）
-        best_bid_price = float(bids[-1].get("price", 0))
-        
-        # 找买二价（第二高的买价，价格低于买一价）
-        second_bid_price = None
-        if len(bids) >= 2:
-            # 从后往前找，找到第一个价格低于买一价的买单
-            for i in range(len(bids) - 2, -1, -1):
-                bid_price = float(bids[i].get("price", 0))
-                if bid_price < best_bid_price:
-                    second_bid_price = bid_price
-                    break
-        
-        # 如果订单簿只有买一价（没有买二价），返回 None（跳过）
+
+        best_bid_price = normalized.best_bid
+        second_bid_price = normalized.second_bid
+
+        # 只有买一价（没有不同的第二档价格）时无法挂买二价
         if second_bid_price is None:
             return None
         
@@ -504,7 +594,8 @@ class MarketMakingStrategy:
             can_place: True 表示可以安全挂单，False 表示不能挂单
             info_dict: 包含详细信息，用于日志输出
         """
-        bids = orderbook.get("bids", [])
+        normalized = normalize_orderbook(orderbook)
+        bids = normalized.normalized_bids  # [(price, size)] 价格从高到低、已聚合同价档位
         
         # 统计价格高于、等于、低于 actual_buy_price 的买单
         bids_above_actual_price = []  # 价格 > actual_buy_price 的买单（排在我们前面）
@@ -512,8 +603,7 @@ class MarketMakingStrategy:
         bids_below_actual_price = []  # 价格 < actual_buy_price 的买单（排在我们后面）
         bids_in_reward_range = []  # 奖励区间内的买单（用于信息展示）
         
-        for bid in bids:
-            bid_price = float(bid.get("price", 0))
+        for bid_price, _ in bids:
             
             # 统计奖励区间内的买单（用于信息展示）
             if buy_price <= bid_price <= sell_price:
@@ -533,32 +623,15 @@ class MarketMakingStrategy:
         bids_below_actual_price.sort(reverse=True)
         bids_in_reward_range.sort(reverse=True)
         
-        # 计算买一价和买二价
-        best_bid_price = None
+        best_bid_price = normalized.best_bid
         best_bid_size = 0.0
-        second_bid_price = None
+        second_bid_price = normalized.second_bid
         second_bid_size = 0.0
-        
-        if bids:
-            # bids 按价格降序排列，bids[-1] 是最高买价（买一价）
-            best_bid_price = float(bids[-1].get("price", 0))
-            # 买一价的份额 = 所有价格为买一价的买单份额之和
-            for bid in bids:
-                if abs(float(bid.get("price", 0)) - best_bid_price) < 0.0001:  # 考虑浮点数精度
-                    best_bid_size += float(bid.get("size", 0))
-            
-            # 找买二价（第二高的买价，价格低于买一价）
-            if len(bids) >= 2:
-                # 从后往前找，找到第一个价格低于买一价的买单
-                for i in range(len(bids) - 2, -1, -1):
-                    bid_price = float(bids[i].get("price", 0))
-                    if bid_price < best_bid_price:
-                        second_bid_price = bid_price
-                        # 买二价的份额 = 所有价格为买二价的买单份额之和
-                        for bid in bids:
-                            if abs(float(bid.get("price", 0)) - second_bid_price) < 0.0001:  # 考虑浮点数精度
-                                second_bid_size += float(bid.get("size", 0))
-                        break
+
+        if normalized.normalized_bids:
+            best_bid_size = normalized.normalized_bids[0][1]
+            if len(normalized.normalized_bids) >= 2:
+                second_bid_size = normalized.normalized_bids[1][1]
         
         # 判断 actual_buy_price 是否等于买二价
         is_second_bid_price = (second_bid_price is not None and 
@@ -636,12 +709,11 @@ class MarketMakingStrategy:
             price_diff = actual_buy_price - next_price
             
             # 计算该价格层的总份额
-            price_size = 0.0
-            for bid in bids:
-                bid_price = float(bid.get("price", 0))
-                if abs(bid_price - next_price) < 0.0001:  # 考虑浮点数精度
-                    price_size += float(bid.get("size", 0))
-            
+            price_size = next(
+                (size for price, size in bids if abs(price - next_price) < 1e-9),
+                0.0,
+            )
+
             cumulative_size += price_size
             next_prices_info.append({
                 "position": i + 1,

@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Optional
 from api_client import PolymarketAPIClient
 from config import config
 from logger import setup_logger
+from market_making_strategy import normalize_orderbook
 
 logger = setup_logger("market_manager")
 
@@ -367,17 +368,15 @@ class MarketManager:
                 if mid_price is None:
                     continue
                 
-                # 从订单簿获取 best_bid 和 best_ask
-                bids = orderbook.get("bids", [])
-                asks = orderbook.get("asks", [])
-                
-                if not bids or not asks:
+                normalized = normalize_orderbook(orderbook)
+
+                if normalized.is_empty or normalized.is_one_sided:
                     continue
                 
-                best_bid = float(bids[-1].get("price", 0))  # 最高买价
-                best_ask = float(asks[-1].get("price", 0))  # 最低卖价
+                best_bid = normalized.best_bid
+                best_ask = normalized.best_ask
                 
-                if best_bid > 0 and best_ask > 0:
+                if best_bid is not None and best_ask is not None and best_bid > 0 and best_ask > 0:
                     # 计算价差 = (best_ask - best_bid) / mid_price
                     spread = best_ask - best_bid
                     spreads.append(spread)

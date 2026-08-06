@@ -22,7 +22,7 @@ from py_clob_client_v2.order_builder.constants import BUY, SELL
 from config import config
 from logger import setup_logger
 from risk_manager import RiskManager
-from market_making_strategy import MarketMakingStrategy
+from market_making_strategy import MarketMakingStrategy, normalize_orderbook
 from api_client import PolymarketAPIClient
 
 # WebSocket 相关导入已移除，现在使用 HTTP 接口获取订单簿
@@ -2522,9 +2522,7 @@ class OrderManager:
                     best_bid_price = None
                     orderbook = self._get_orderbook(token_id)
                     if orderbook:
-                        bids = orderbook.get("bids", [])
-                        if bids:
-                            best_bid_price = float(bids[-1].get("price", 0) or 0)
+                        best_bid_price = normalize_orderbook(orderbook).best_bid
                     
                     max_bid_gap = config.hedge_sell_max_bid_gap
                     
@@ -2780,9 +2778,7 @@ class OrderManager:
         best_bid_price = None
         orderbook = self._get_orderbook(token_id)
         if orderbook:
-            bids = orderbook.get("bids", [])
-            if bids:
-                best_bid_price = float(bids[-1].get("price", 0) or 0)
+            best_bid_price = normalize_orderbook(orderbook).best_bid
         
         max_bid_gap = config.hedge_sell_max_bid_gap
         use_best_bid = (
@@ -3316,22 +3312,10 @@ class OrderManager:
                     is_currently_best_bid = False
                     is_currently_second_bid = False
                     if side == "BUY":
-                        bids = orderbook.get("bids", [])
-                        best_bid = None
-                        second_bid = None
-                        
-                        if bids:
-                            # bids 按价格降序排列，bids[-1] 是最高买价（买一价）
-                            best_bid = float(bids[-1].get("price", 0)) if bids else None
-                            
-                            # 找买二价（第二高的买价）
-                            if len(bids) >= 2:
-                                for i in range(len(bids) - 2, -1, -1):
-                                    bid_price = float(bids[i].get("price", 0))
-                                    if bid_price < best_bid:
-                                        second_bid = bid_price
-                                        break
-                        
+                        normalized_book = normalize_orderbook(orderbook)
+                        best_bid = normalized_book.best_bid
+                        second_bid = normalized_book.second_bid
+
                         if best_bid is not None:
                             # 如果当前订单价格等于或接近买一价（考虑浮点数精度），认为是买一价
                             # 使用 0.0001 的容差来判断是否相等
