@@ -121,6 +121,10 @@ class OrderManager:
         self.order_fingerprints: Dict[str, float] = {}
         # 库存代数：token_id -> generation（用于订单指纹区分不同批次库存）
         self.inventory_generations: Dict[str, int] = {}
+        # 普通重新报价连续确认：token_id -> {"target": float, "count": int}
+        self.requote_confirmations: Dict[str, Dict[str, Any]] = {}
+        # 普通重新报价撤单时间：token_id -> monotonic
+        self.last_requote_cancel: Dict[str, float] = {}
         self._init_metrics()
         
         # WebSocket 相关初始化已移除，现在使用 HTTP 接口获取订单簿
@@ -1346,7 +1350,7 @@ class OrderManager:
                         self.pending_reorder_tokens[token_id] = {
                             "market_id": market_id,
                             "side": "BUY",
-                            "last_attempt_time": time.time(),
+                            "last_attempt_time": self._monotonic(),
                             "target_price": actual_buy_price,  # 使用实际挂单价格作为目标价格
                             "order_size": order_size,
                             "safety_info": safety_info
@@ -3692,6 +3696,14 @@ class OrderManager:
                         target_price = prices.get("sell_price")
                     
                     if target_price:
+                        # 库存存在时清理 pending；冷却期内不无限重试
+                        if self.has_inventory_or_pending_exit(token_id):
+                            with self.lock:
+                                self.pending_reorder_tokens.pop(token_id, None)
+                            continue
+                        last_attempt = pending_info.get("last_attempt_time", 0)
+                        if self._monotonic() - float(last_attempt or 0) < config.requote_cooldown_seconds:
+                            continue
                         # 收集待重新挂单的 token 信息
                         pending_tokens_to_check.append({
                             "market_id": market_id,
@@ -3699,7 +3711,7 @@ class OrderManager:
                             "side": side,
                             "target_price": target_price,
                             "order_size": pending_info.get("order_size", 50),
-                            "last_attempt_time": pending_info.get("last_attempt_time", 0),
+                            "last_attempt_time": last_attempt,
                             "prices": prices
                         })
                 
@@ -3742,93 +3754,90 @@ class OrderManager:
                     if side == "SELL":
                         continue
                     
-                    # 对于买单，需要计算实际挂单价格（买二价或奖励下边界）
-                    actual_buy_price_for_check = None
+                    # ---- 新逻辑：先验证后撤单 + 撤挂迟滞 ----
+                    market = self.market_data_cache.get(market_id, {})
+                    tick_size = self.strategy.get_order_price_min_tick_size(market)
+                    normalized_book = normalize_orderbook(
+                        orderbook, now_monotonic=self._monotonic()
+                    )
+                    book_fresh = (
+                        normalized_book.age_seconds is not None
+                        and normalized_book.age_seconds <= config.max_orderbook_age_seconds
+                    )
+
+                    current_size = order_info.get("size", 0)
+                    current_exposure = order_info.get("exposure", 0)
+                    current_created_at = order_info.get("created_at", 0)
+                    if not current_size:
+                        current_size = (
+                            self.strategy.calculate_order_size(market) if market else 50
+                        )
+
+                    buy_price_boundary = prices.get("buy_price")
+                    sell_price_boundary = prices.get("sell_price")
                     safety_violation = False
                     safety_info = {}
-                    order_size_for_check = order_info.get("size", 0)
-                    if side == "BUY":
-                        buy_price_for_check = target_price  # target_price 就是 buy_price
-                        actual_buy_price_for_check = self.strategy.calculate_actual_buy_price(orderbook, buy_price_for_check)
-                        
-                        # 如果没有实际挂单价格（订单簿只有买一价），不触发调整（无法挂买二价）
-                        if actual_buy_price_for_check is None:
-                            should_adjust = False
-                            continue
-                        
-                        if not order_size_for_check:
-                            market = self.market_data_cache.get(market_id)
-                            if market:
-                                order_size_for_check = self.strategy.calculate_order_size(market)
-                            else:
-                                order_size_for_check = 50  # 默认值
-                        
-                        buy_price_boundary = prices.get("buy_price")
-                        sell_price_boundary = prices.get("sell_price")
-                        if buy_price_boundary and sell_price_boundary:
+                    actual_buy_price_for_check = None
+                    if side == "BUY" and buy_price_boundary and sell_price_boundary:
+                        actual_buy_price_for_check = self.strategy.calculate_actual_buy_price(
+                            orderbook, buy_price_boundary
+                        )
+                        if actual_buy_price_for_check is not None:
                             can_stay, safety_info = self.strategy.can_place_buy_order_safely(
                                 orderbook,
                                 buy_price_boundary,
                                 sell_price_boundary,
-                                order_size_for_check,
-                                actual_buy_price_for_check
+                                current_size,
+                                actual_buy_price_for_check,
                             )
                             if not can_stay:
                                 safety_violation = True
-                        else:
-                            safety_info = {}
-                        
-                        # 判断当前订单价格是否等于实际挂单价格（买二价或奖励下边界）
-                        # 买单不进行规范化，直接比较原始价格
-                        # 使用较小的容差处理浮点数精度问题
-                        if abs(current_price - actual_buy_price_for_check) < 0.0001 and not safety_violation:
-                            # 当前订单价格等于实际挂单价格，不触发调整
-                            should_adjust = False
-                            continue
-                    
-                    # 计算价格偏离（基点）
-                    # 对于买单，比较当前价格和实际挂单价格（买二价或奖励下边界），而不是奖励区间边界
-                    if side == "BUY" and actual_buy_price_for_check is not None:
-                        price_diff = abs(current_price - actual_buy_price_for_check)
-                    else:
-                        price_diff = abs(current_price - target_price)
-                    price_diff_bps = int(price_diff * 10000)  # 转换为基点
-                    
-                    # 如果价格偏离超过阈值，或者当前订单是买一价，收集订单信息用于后续调整
-                    # 注意：如果订单处于买二价位置，即使价格偏离也不调整，因为我们的策略是"只挂买二价"
-                    threshold_bps = config.price_deviation_threshold_bps
-                    # 如果处于买二价位置，不触发调整（即使价格偏离）
-                    if is_currently_second_bid and not safety_violation:
-                        should_adjust = False
-                    else:
-                        # 如果价格偏离超过阈值，或者是买一价，触发调整
-                        should_adjust = safety_violation or price_diff_bps > threshold_bps or is_currently_best_bid
-                    
-                    if should_adjust:
-                        # 获取当前订单详细信息
-                        current_size = order_info.get("size", 0)
-                        current_exposure = order_info.get("exposure", 0)
-                        current_created_at = order_info.get("created_at", 0)
-                        
-                        # 获取市场信息用于显示
-                        market = self.market_data_cache.get(market_id, {})
-                        question = market.get("question", "N/A")
-                        outcome = None
-                        for token in market.get("tokens", []):
-                            if token.get("token_id") == token_id:
-                                outcome = token.get("outcome", "N/A")
-                                break
-                        
-                        # 收集需要调整的订单信息（不在这里执行操作，避免死锁）
-                        # 记录调整原因：如果是因为买一价位置，标记为买一价原因；否则标记为价格偏离原因
-                        adjust_reason = None
-                        if safety_violation:
-                            adjust_reason = "safety_violation"
-                        elif is_currently_best_bid:
-                            adjust_reason = "best_bid"  # 因为买一价位置而调整
-                        elif price_diff_bps > threshold_bps:
-                            adjust_reason = "price_deviation"  # 因为价格偏离而调整
-                        
+
+                    # 当前订单位置是否仍有足够保护深度
+                    protection_size = 0.0
+                    if normalized_book.normalized_bids:
+                        protection_size = normalized_book.normalized_bids[0][1]
+                        if len(normalized_book.normalized_bids) >= 2:
+                            protection_size += normalized_book.normalized_bids[1][1]
+                    protection_ok = (
+                        protection_size
+                        >= current_size * config.min_protection_size_multiplier
+                    )
+
+                    spread_too_wide = False
+                    if (
+                        normalized_book.best_bid is not None
+                        and normalized_book.best_ask is not None
+                    ):
+                        max_spread = config.spread_range.get("max")
+                        if max_spread is not None and (
+                            normalized_book.best_ask - normalized_book.best_bid
+                        ) > max_spread:
+                            spread_too_wide = True
+
+                    danger = (
+                        side == "BUY"
+                        and (
+                            is_currently_best_bid
+                            or not protection_ok
+                            or spread_too_wide
+                            or normalized_book.is_crossed
+                        )
+                    )
+                    new_target_safe = bool(
+                        actual_buy_price_for_check is not None and not safety_violation
+                    )
+
+                    # 获取市场信息用于显示
+                    question = market.get("question", "N/A")
+                    outcome = None
+                    for token in market.get("tokens", []):
+                        if token.get("token_id") == token_id:
+                            outcome = token.get("outcome", "N/A")
+                            break
+
+                    if danger:
+                        # 危险情况立即撤单；新目标不安全时只取消不重挂
                         orders_to_adjust.append({
                             "market_id": market_id,
                             "token_id": token_id,
@@ -3836,21 +3845,92 @@ class OrderManager:
                             "order_id": order_id,
                             "current_price": current_price,
                             "target_price": target_price,
-                            "actual_buy_price": actual_buy_price_for_check if side == "BUY" else None,  # 实际挂单价格（买二价或奖励下边界）
+                            "actual_buy_price": actual_buy_price_for_check,
                             "current_size": current_size,
                             "current_exposure": current_exposure,
                             "current_created_at": current_created_at,
-                            "price_diff": price_diff,
-                            "price_diff_bps": price_diff_bps,
+                            "price_diff": abs(current_price - (actual_buy_price_for_check or current_price)),
+                            "price_diff_bps": 0,
                             "question": question,
                             "outcome": outcome,
                             "prices": prices,
-                            "is_currently_best_bid": is_currently_best_bid,  # 标记当前订单是否是买一价
-                            "is_currently_second_bid": is_currently_second_bid,  # 标记当前订单是否是买二价（仅用于信息展示）
-                            "adjust_reason": adjust_reason,  # 调整原因
+                            "is_currently_best_bid": is_currently_best_bid,
+                            "is_currently_second_bid": is_currently_second_bid,
+                            "adjust_reason": "danger",
                             "safety_info": safety_info or {},
-                            "order_size_for_check": order_size_for_check
+                            "order_size_for_check": current_size,
+                            "new_target_safe": new_target_safe,
                         })
+                        continue
+
+                    if actual_buy_price_for_check is None and side == "BUY":
+                        # 新目标无法计算（例如只有买一价）：旧订单安全则保留
+                        continue
+
+                    # 普通调整：完整 preflight + 迟滞门槛
+                    if not book_fresh:
+                        continue
+                    if self.has_inventory_or_pending_exit(token_id):
+                        self.metrics["blocked_reentry_count"] += 1
+                        continue
+                    if safety_violation:
+                        # 新目标不安全：保留旧安全订单
+                        continue
+
+                    target_actual = (
+                        actual_buy_price_for_check if side == "BUY" else target_price
+                    )
+                    if target_actual is None:
+                        continue
+                    price_diff = abs(float(current_price) - float(target_actual))
+                    if price_diff < tick_size * max(1, config.requote_min_ticks) - 1e-9:
+                        # 变化不足（含相同价格），不撤挂
+                        continue
+                    if self._monotonic() - float(current_created_at or 0) < config.min_quote_lifetime_seconds:
+                        continue
+                    with self.lock:
+                        last_cancel = self.last_requote_cancel.get(token_id, 0.0)
+                    if self._monotonic() - last_cancel < config.requote_cooldown_seconds:
+                        continue
+
+                    target_key = round(float(target_actual), 8)
+                    with self.lock:
+                        prev = self.requote_confirmations.get(token_id)
+                        if prev is not None and abs(prev.get("target", -1.0) - target_key) < 1e-9:
+                            count = prev.get("count", 0) + 1
+                        else:
+                            count = 1
+                        self.requote_confirmations[token_id] = {
+                            "target": target_key,
+                            "count": count,
+                        }
+                    if count < config.requote_confirmations:
+                        continue
+
+                    price_diff_bps = int(price_diff * 10000)
+                    orders_to_adjust.append({
+                        "market_id": market_id,
+                        "token_id": token_id,
+                        "side": side,
+                        "order_id": order_id,
+                        "current_price": current_price,
+                        "target_price": target_price,
+                        "actual_buy_price": actual_buy_price_for_check,
+                        "current_size": current_size,
+                        "current_exposure": current_exposure,
+                        "current_created_at": current_created_at,
+                        "price_diff": price_diff,
+                        "price_diff_bps": price_diff_bps,
+                        "question": question,
+                        "outcome": outcome,
+                        "prices": prices,
+                        "is_currently_best_bid": is_currently_best_bid,
+                        "is_currently_second_bid": is_currently_second_bid,
+                        "adjust_reason": "price_deviation",
+                        "safety_info": safety_info or {},
+                        "order_size_for_check": current_size,
+                        "new_target_safe": new_target_safe,
+                    })
         
         # 第二阶段：释放锁后，执行取消和挂单操作
         for order_data in orders_to_adjust:
@@ -3871,15 +3951,14 @@ class OrderManager:
             is_currently_best_bid = order_data.get("is_currently_best_bid", False)
             is_currently_second_bid = order_data.get("is_currently_second_bid", False)
             adjust_reason = order_data.get("adjust_reason", "price_deviation")
+            new_target_safe = order_data.get("new_target_safe", True)
             
             # 打印订单调整信息
             logger.info("=" * 80)
-            if adjust_reason == "safety_violation":
-                logger.info(f"⚠️  检测到订单触发安全检查（价格断层/保护不足），需要立即取消:")
-            elif adjust_reason == "best_bid":
-                logger.info(f"⚠️  检测到订单处于买一价位置，需要调整（风险管理）:")
+            if adjust_reason == "danger":
+                logger.info(f"⚠️  检测到危险情况（买一价/保护消失/点差超限/crossed），立即撤单:")
             elif adjust_reason == "price_deviation":
-                logger.info(f"检测到订单价格偏离，准备调整:")
+                logger.info(f"检测到订单价格偏离达到门槛并经连续确认，准备调整:")
             else:
                 logger.info(f"检测到订单需要调整:")
             logger.info(f"  市场ID: {market_id}")
@@ -3906,20 +3985,17 @@ class OrderManager:
                 logger.info(f"  奖励区间边界: {target_price:.4f}")
             else:
                 logger.info(f"  目标价格: {target_price:.4f} (奖励区间边界)")
-            if adjust_reason == "safety_violation":
-                logger.info(f"  调整原因: 现有挂单已不满足价格断层/保护要求")
-                safety_info = order_data.get("safety_info") or {}
-                reason = safety_info.get("reason") or safety_info.get("price_cliff_reason")
-                if reason:
-                    logger.info(f"  详细原因: {reason}")
-            elif adjust_reason == "best_bid":
-                logger.info(f"  调整原因: 当前订单处于买一价位置（风险管理）")
+            if adjust_reason == "danger":
+                logger.info(f"  调整原因: 危险情况立即撤单")
+                if not new_target_safe:
+                    logger.info(f"  新目标不安全：只取消，不重挂")
             elif adjust_reason == "price_deviation":
-                logger.info(f"  价格偏离: {price_diff:.4f} ({price_diff_bps} bps, 阈值={config.price_deviation_threshold_bps} bps)")
+                logger.info(
+                    f"  价格偏离: {price_diff:.4f} "
+                    f"(需 ≥ {config.requote_min_ticks} ticks 且连续 {config.requote_confirmations} 次确认)"
+                )
                 if side == "BUY" and actual_buy_price is not None:
                     logger.info(f"  （当前价格 {current_price:.4f} vs 实际挂单价格 {actual_buy_price:.4f}）")
-                if is_currently_second_bid:
-                    logger.info(f"  （注：订单当前处于买二价位置，但调整原因是价格偏离）")
             else:
                 logger.info(f"  调整原因: 未知")
             logger.info(f"  中间价: {prices.get('mid_price', 0):.4f}")
@@ -3928,6 +4004,13 @@ class OrderManager:
             
             # 取消旧订单（此时已释放锁，不会死锁）
             if self.cancel_order(order_id):
+                with self.lock:
+                    self.last_requote_cancel[token_id] = self._monotonic()
+                if adjust_reason == "danger":
+                    self.metrics["safety_cancels"] += 1
+                else:
+                    self.metrics["requotes"] += 1
+                self.metrics["buys_cancelled"] += 1
                 # 重新挂单前，如果是买单，检查是否可以安全挂单（风险管理）
                 if side == "BUY":
                     # 使用已经批量获取的订单簿数据（避免重复获取）
@@ -3936,6 +4019,18 @@ class OrderManager:
                         # 如果批量获取的数据中没有，才单独获取
                         current_orderbook = self._get_orderbook(token_id)
                     if current_orderbook:
+                        # 新鲜度检查：过期订单簿不用于恢复 BUY
+                        current_normalized = normalize_orderbook(
+                            current_orderbook, now_monotonic=self._monotonic()
+                        )
+                        if (
+                            current_normalized.age_seconds is None
+                            or current_normalized.age_seconds > config.max_orderbook_age_seconds
+                        ):
+                            with self.lock:
+                                if token_id in self.pending_reorder_tokens:
+                                    self.pending_reorder_tokens[token_id]["last_attempt_time"] = self._now()
+                            continue
                         # 获取奖励区间边界
                         buy_price = prices.get("buy_price")
                         sell_price = prices.get("sell_price")
@@ -3965,7 +4060,7 @@ class OrderManager:
                                     self.pending_reorder_tokens[token_id] = {
                                         "market_id": market_id,
                                         "side": side,
-                                        "last_attempt_time": time.time(),
+                                        "last_attempt_time": self._monotonic(),
                                         "target_price": buy_price,
                                         "order_size": current_size if current_size else (self.strategy.calculate_order_size(self.market_data_cache.get(market_id)) if self.market_data_cache.get(market_id) else 50),
                                         "safety_info": {"reason": "订单簿只有买一价"}
@@ -3999,7 +4094,7 @@ class OrderManager:
                                     self.pending_reorder_tokens[token_id] = {
                                         "market_id": market_id,
                                         "side": side,
-                                        "last_attempt_time": time.time(),
+                                        "last_attempt_time": self._monotonic(),
                                         "target_price": target_price,
                                         "order_size": current_size if current_size else (self.strategy.calculate_order_size(self.market_data_cache.get(market_id)) if self.market_data_cache.get(market_id) else 50),
                                         "safety_info": safety_info
@@ -4165,7 +4260,7 @@ class OrderManager:
                                 # 更新 last_attempt_time 和 safety_info
                                 with self.lock:
                                     if token_id in self.pending_reorder_tokens:
-                                        self.pending_reorder_tokens[token_id]["last_attempt_time"] = time.time()
+                                        self.pending_reorder_tokens[token_id]["last_attempt_time"] = self._monotonic()
                                         self.pending_reorder_tokens[token_id]["safety_info"] = {"reason": "订单簿只有买一价"}
                                 
                                 continue  # 跳过重新挂单
@@ -4188,7 +4283,7 @@ class OrderManager:
                                 # 更新 last_attempt_time 和 safety_info
                                 with self.lock:
                                     if token_id in self.pending_reorder_tokens:
-                                        self.pending_reorder_tokens[token_id]["last_attempt_time"] = time.time()
+                                        self.pending_reorder_tokens[token_id]["last_attempt_time"] = self._monotonic()
                                         self.pending_reorder_tokens[token_id]["safety_info"] = safety_info
                                 
                                 continue  # 跳过重新挂单

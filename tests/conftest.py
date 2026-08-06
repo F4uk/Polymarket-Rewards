@@ -86,6 +86,7 @@ def make_order_manager(
     om.requote_confirmations = {}
     om.position_diff_confirmations = {}
     om.inventory_generations = {}
+    om.last_requote_cancel = {}
     om.metrics = {}
     om.lock = threading.RLock()
     om._now = clock.time
