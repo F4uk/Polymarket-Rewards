@@ -125,6 +125,8 @@ class OrderManager:
         self.requote_confirmations: Dict[str, Dict[str, Any]] = {}
         # 普通重新报价撤单时间：token_id -> monotonic
         self.last_requote_cancel: Dict[str, float] = {}
+        # 取消待确认订单：order_id -> info（取消传播期间继续处理成交差额）
+        self.cancel_pending_tracking: Dict[str, Dict[str, Any]] = {}
         self._init_metrics()
         
         # WebSocket 相关初始化已移除，现在使用 HTTP 接口获取订单簿
@@ -492,7 +494,12 @@ class OrderManager:
                 return None
             if (
                 state.get("sell_order_id")
-                and state.get("sell_order_status") in ("PENDING_CONFIRMATION", "LIVE", "CANCEL_PENDING")
+                and state.get("sell_order_status") in (
+                    "PENDING_CONFIRMATION",
+                    "LIVE",
+                    "CANCEL_PENDING",
+                    "UNKNOWN",
+                )
             ):
                 return None
             available = float(state.get("remaining_size", 0.0)) - float(state.get("pending_sell_size", 0.0))
@@ -718,6 +725,22 @@ class OrderManager:
                 logger.info(f"SELL 成交确认，库存已清: token={token_id[:20]}...")
                 return
             if (
+                current.get("sell_order_status") == "PENDING_CONFIRMATION"
+                and sell_order_id not in open_order_ids
+            ):
+                submitted = float(current.get("last_action_at") or 0)
+                if (
+                    self._monotonic() - submitted
+                    > float(config.order_confirmation_timeout_seconds)
+                ):
+                    current["sell_order_status"] = "UNKNOWN"
+                    self.metrics["unknown_order_count"] += 1
+                    logger.warning(
+                        f"SELL 确认超时进入 UNKNOWN: token={token_id[:20]}..., "
+                        f"order_id={sell_order_id[:20]}..."
+                    )
+                    return
+            if (
                 current.get("sell_order_status") == "CANCEL_PENDING"
                 and sell_order_id not in open_order_ids
             ):
@@ -729,6 +752,17 @@ class OrderManager:
                 )
                 return
             current["sell_order_status"] = "LIVE"
+
+    def _adjust_sell_to_position(self, token_id: str, sell_id: str) -> None:
+        """Cancel the current SELL and re-list for the reconciled position."""
+        if self.cancel_order(sell_id):
+            with self.lock:
+                state = self.inventory_exits.get(token_id)
+                if state is not None:
+                    state["sell_order_id"] = None
+                    state["sell_order_status"] = "CANCELLED"
+                    state["pending_sell_size"] = 0.0
+            self._process_inventory_exit(token_id)
 
     def check_inventory_exits(self) -> Dict[str, bool]:
         """Process all tracked inventory: confirm sells and advance exit states."""
@@ -750,6 +784,196 @@ class OrderManager:
                 else:
                     results[token_id] = False
         return results
+
+    # ------------------------------------------------------------------
+    # 订单确认与幂等对账（Phase 8）
+    # ------------------------------------------------------------------
+    def _confirm_pending_orders(self) -> None:
+        """Bounded confirmation of PENDING_CONFIRMATION orders.
+
+        Open-order visibility is confirmed within
+        ORDER_CONFIRMATION_TIMEOUT_SECONDS; after the timeout the order moves
+        to UNKNOWN for reconciliation. Temporary invisibility is not failure.
+        """
+        now = self._monotonic()
+        timeout = float(config.order_confirmation_timeout_seconds)
+        pending = []
+        with self.lock:
+            for market_id, tokens in self.active_orders.items():
+                for token_id, sides in tokens.items():
+                    for side, info in sides.items():
+                        if info.get("status") in ("PENDING_CONFIRMATION", "SUBMITTED"):
+                            pending.append((market_id, token_id, side, info))
+        if not pending:
+            return
+        try:
+            open_orders = self.clob_client.get_open_orders(OpenOrderParams()) or []
+            open_ids = {o.get("id") for o in open_orders if o.get("id")}
+        except Exception:
+            open_ids = set()
+        for market_id, token_id, side, info in pending:
+            order_id = info.get("order_id")
+            submitted = float(info.get("submitted_at") or info.get("created_at") or now)
+            with self.lock:
+                current = (
+                    self.active_orders.get(market_id, {})
+                    .get(token_id, {})
+                    .get(side)
+                )
+                if current is None:
+                    continue
+                if order_id in open_ids:
+                    current["status"] = "LIVE"
+                    continue
+                filled = self._query_order_filled_size(order_id)
+                if filled > 0:
+                    filled_size = min(float(filled), float(info.get("size", 0) or filled))
+                    current["status"] = (
+                        "FILLED"
+                        if filled_size >= float(info.get("size", 0) or filled_size)
+                        else "PARTIALLY_FILLED"
+                    )
+                    if side == "BUY":
+                        self._handle_buy_fill(
+                            market_id, token_id, info.get("price"), filled_size
+                        )
+                    else:
+                        self._confirm_inventory_sells(token_id)
+                    del self.active_orders[market_id][token_id][side]
+                    logger.info(
+                        f"待确认订单经成交记录确认: order_id={order_id}, "
+                        f"side={side}, filled={filled_size:.2f}"
+                    )
+                elif now - submitted > timeout:
+                    current["status"] = "UNKNOWN"
+                    self.metrics["unknown_order_count"] += 1
+                    logger.warning(
+                        f"订单确认超时进入 UNKNOWN: order_id={order_id}, "
+                        f"token={token_id[:20]}..., side={side}"
+                    )
+        with self.lock:
+            pending_count = 0
+            unknown_count = 0
+            for _market_id, tokens in self.active_orders.items():
+                for _token_id, sides in tokens.items():
+                    for _side, info in sides.items():
+                        status = info.get("status")
+                        if status in ("PENDING_CONFIRMATION", "SUBMITTED"):
+                            pending_count += 1
+                        elif status == "UNKNOWN":
+                            unknown_count += 1
+            self.metrics["pending_confirmation_count"] = float(pending_count)
+            self.metrics["unknown_order_count"] = float(unknown_count)
+
+    def _reconcile_unknown_orders(self) -> None:
+        """Reconcile UNKNOWN orders using trades, open orders, and positions.
+
+        A SELL is not retried before reconciliation; only reliable evidence
+        (no open order, no fills, no position) marks it FAILED.
+        """
+        unknowns = []
+        with self.lock:
+            for market_id, tokens in self.active_orders.items():
+                for token_id, sides in tokens.items():
+                    for side, info in sides.items():
+                        if info.get("status") == "UNKNOWN":
+                            unknowns.append((market_id, token_id, side, info))
+        if not unknowns:
+            return
+        try:
+            open_orders = self.clob_client.get_open_orders(OpenOrderParams()) or []
+            open_ids = {o.get("id") for o in open_orders if o.get("id")}
+        except Exception:
+            open_ids = set()
+        try:
+            positions = self.get_positions(size_threshold=0.1, limit=1000)
+        except Exception:
+            positions = []
+        positions_by_token = {
+            p.get("asset"): float(p.get("size", 0) or 0) for p in positions
+        }
+
+        for market_id, token_id, side, info in unknowns:
+            order_id = info.get("order_id")
+            filled = self._query_order_filled_size(order_id)
+            with self.lock:
+                current = (
+                    self.active_orders.get(market_id, {})
+                    .get(token_id, {})
+                    .get(side)
+                )
+                if current is None:
+                    continue
+                if order_id in open_ids:
+                    current["status"] = "LIVE"
+                    continue
+                if filled > 0:
+                    filled_size = min(float(filled), float(info.get("size", 0) or filled))
+                    current["status"] = (
+                        "FILLED"
+                        if filled_size >= float(info.get("size", 0) or filled_size)
+                        else "PARTIALLY_FILLED"
+                    )
+                    if side == "BUY":
+                        self._handle_buy_fill(
+                            market_id, token_id, info.get("price"), filled_size
+                        )
+                    else:
+                        self._confirm_inventory_sells(token_id)
+                    del self.active_orders[market_id][token_id][side]
+                    logger.info(
+                        f"UNKNOWN 订单对账确认成交: order_id={order_id}, "
+                        f"side={side}, filled={filled_size:.2f}"
+                    )
+                elif token_id not in positions_by_token:
+                    current["status"] = "FAILED"
+                    del self.active_orders[market_id][token_id][side]
+                    if side == "SELL":
+                        state = self.inventory_exits.get(token_id)
+                        if state and state.get("sell_order_id") == order_id:
+                            state["sell_order_id"] = None
+                            state["sell_order_status"] = "FAILED"
+                            state["pending_sell_size"] = 0.0
+                    logger.warning(
+                        f"UNKNOWN 订单对账认定为失败（无订单/无成交/无持仓）: order_id={order_id}"
+                    )
+                else:
+                    # 有持仓但无成交记录：继续保留 UNKNOWN，等待更多证据
+                    logger.debug(
+                        f"UNKNOWN 订单保留待更多证据: order_id={order_id}"
+                    )
+
+    def _process_cancel_pending(self) -> None:
+        """Confirm CANCEL_PENDING orders and keep processing fill deltas."""
+        with self.lock:
+            tracking = {
+                k: dict(v) for k, v in self.cancel_pending_tracking.items()
+            }
+        if not tracking:
+            return
+        try:
+            open_orders = self.clob_client.get_open_orders(OpenOrderParams()) or []
+            open_ids = {o.get("id") for o in open_orders if o.get("id")}
+        except Exception:
+            open_ids = set()
+        for order_id, track in tracking.items():
+            if order_id in open_ids:
+                # 取消尚未传播：不重复发送取消请求，继续等待
+                continue
+            filled = self._query_order_filled_size(order_id)
+            with self.lock:
+                if filled > 0:
+                    if track["side"] == "BUY":
+                        self._handle_buy_fill(
+                            track["market_id"],
+                            track["token_id"],
+                            track["price"],
+                            min(float(filled), float(track["size"] or filled)),
+                        )
+                    else:
+                        self._confirm_inventory_sells(track["token_id"])
+                self.cancel_pending_tracking.pop(order_id, None)
+            logger.info(f"取消已确认: order_id={order_id}")
     
     def place_order(
         self,
@@ -903,51 +1127,12 @@ class OrderManager:
                     if order_status in ("matched", "delayed", "unmatched"):
                         return response
 
-                    # 验证订单是否真正挂单：轮询查询活跃订单列表
-                    # 注意：CLOB V2 的 open orders 接口存在传播延迟，新挂订单不会立即出现，
-                    # 因此需要多次重试，避免把真实存在的挂单误判为失败
-                    try:
-                        verify_attempts = 4
-                        verify_delay = 0.5
-                        order_found = False
-                        for verify_idx in range(verify_attempts):
-                            time.sleep(verify_delay)
-                            open_orders = self.clob_client.get_open_orders(OpenOrderParams())
-                            open_order_ids = {order.get("id") for order in open_orders if order.get("id")}
-                            if order_id in open_order_ids:
-                                order_found = True
-                                break
-                        
-                        if not order_found:
-                            # 轮询未查到，但 post_order 已返回 success=True 且 status=live。
-                            # CLOB V2 的 open orders 接口存在传播延迟，这里很可能是误判，
-                            # 因此信任下单响应、保留内部记录，仅记录告警。
-                            # 后续 check_orders 循环会定期与真实挂单对账修正。
-                            price_decimal_places = 2
-                            price_str = f"{price:.10f}".rstrip('0').rstrip('.')
-                            if '.' in price_str:
-                                price_decimal_places = len(price_str.split('.')[1])
-                                price_decimal_places = min(price_decimal_places, 4)  # 最多显示4位小数
-                            
-                            logger.warning(
-                                f"订单暂未在活跃列表确认（可能为接口传播延迟），信任下单响应保留记录: "
-                                f"订单ID={order_id}, 市场={market_id}, token={token_id[:20]}..., "
-                                f"方向={side}, 价格={price:.{price_decimal_places}f}, 份额={size:.2f}"
-                            )
-                        else:
-                            # 订单验证成功，真正挂单
-                            logger.info(
-                                f"订单验证成功: 订单ID={order_id} 已在活跃订单列表中，"
-                                f"市场={market_id}, token={token_id[:20]}..., 方向={side}"
-                            )
-                    except Exception as e:
-                        # 验证过程出错，记录警告但不确定订单是否成功
-                        logger.warning(
-                            f"订单验证过程出错: {e}, 订单ID={order_id}, "
-                            f"无法确认订单是否真正挂单，但API返回成功"
-                        )
-                        # 继续返回响应，因为API已返回成功
-                    
+                    # 订单已记录为 PENDING_CONFIRMATION；传播延迟由确认循环处理，
+                    # 暂时查不到不等于失败，这里不再阻塞等待。
+                    logger.info(
+                        f"订单已提交（待确认）: 订单ID={order_id}, 市场={market_id}, "
+                        f"token={token_id[:20]}..., 方向={side}, 价格={price:.4f}, 份额={size:.2f}"
+                    )
                     return response
                 else:
                     error_msg = response.get("errorMsg", "未知错误") if response else "响应为空"
@@ -1542,6 +1727,11 @@ class OrderManager:
         cancelled_count = 0
         
         try:
+            # 订单确认窗口与幂等对账（传播延迟不等于失败）
+            self._confirm_pending_orders()
+            self._reconcile_unknown_orders()
+            self._process_cancel_pending()
+
             # 第一步：检查部分成交订单跟踪列表，检测剩余部分的成交
             if self.partial_filled_tracking:
                 try:
@@ -1689,6 +1879,15 @@ class OrderManager:
                     for token_id, sides_dict in list(tokens_dict.items()):
                         for side, order_info in list(sides_dict.items()):
                             order_id = order_info.get("order_id")
+                            status = order_info.get("status", "LIVE")
+                            # 确认窗口内/UNKNOWN 的订单由确认与对账逻辑处理，
+                            # 不得在这里误判为已取消。
+                            if status in (
+                                "PENDING_CONFIRMATION",
+                                "SUBMITTED",
+                                "UNKNOWN",
+                            ):
+                                continue
                             if order_id and order_id not in open_order_ids:
                                 # 如果订单已经在跟踪列表中，跳过（避免重复处理）
                                 if order_id not in tracked_order_ids:
@@ -1837,6 +2036,13 @@ class OrderManager:
                     for token_id, sides_dict in list(tokens_dict.items()):
                         for side, order_info in list(sides_dict.items()):
                             order_id = order_info.get("order_id")
+                            order_status = order_info.get("status", "LIVE")
+                            if order_status in (
+                                "PENDING_CONFIRMATION",
+                                "SUBMITTED",
+                                "UNKNOWN",
+                            ):
+                                continue
                             original_size = order_info.get("size", 0)
                             
                             # 检查订单是否仍在活跃列表中
@@ -2883,7 +3089,8 @@ class OrderManager:
                         )
                     else:
                         confirmed = float(state.get("confirmed_filled_size", 0.0))
-                        if position_size > confirmed + config.position_dust_size:
+                        # 仅把明显增长（超过 1 份额）视为真实新成交；微小差异走连续确认
+                        if position_size > confirmed + 1.0:
                             state["confirmed_filled_size"] = position_size
                             state["remaining_size"] = max(
                                 0.0,
@@ -2893,6 +3100,35 @@ class OrderManager:
                                 f"对账：持仓增长 token={token_id[:20]}... "
                                 f"{confirmed:.2f} -> {position_size:.2f}"
                             )
+                        # 微小持仓差异：连续确认后才调整 SELL（紧急退出可直接绕过）
+                        state_is_emergency = state.get("state") == "EMERGENCY_EXIT"
+                        sell_id = state.get("sell_order_id")
+                        sell_status = state.get("sell_order_status")
+                        sell_active = bool(
+                            sell_id
+                            and sell_status in ("PENDING_CONFIRMATION", "LIVE")
+                        )
+                        expected = float(state.get("confirmed_filled_size", 0.0)) - float(
+                            state.get("sold_size", 0.0)
+                        )
+                        diff = abs(position_size - expected)
+                        if (
+                            sell_active
+                            and not state_is_emergency
+                            and diff > config.position_dust_size
+                            and diff < 1.0
+                        ):
+                            count = self.position_diff_confirmations.get(token_id, 0) + 1
+                            self.position_diff_confirmations[token_id] = count
+                            if count >= config.position_change_confirmations:
+                                self.position_diff_confirmations[token_id] = 0
+                                logger.info(
+                                    f"持仓微小差异连续确认，调整 SELL: token={token_id[:20]}... "
+                                    f"diff={diff:.4f}"
+                                )
+                                self._adjust_sell_to_position(token_id, sell_id)
+                        else:
+                            self.position_diff_confirmations[token_id] = 0
 
             # 3. 推进库存退出流程（SELL 确认 + 状态迁移）
             return self.check_inventory_exits()
@@ -3238,6 +3474,17 @@ class OrderManager:
                                 market_id_to_update = market_id
                                 exposure_to_remove = order_info.get("exposure", 0)
                                 order_info_to_remove = (market_id, token_id, side)
+
+                                # 取消传播期间继续处理成交差额（CANCEL_PENDING）
+                                self.cancel_pending_tracking[order_id] = {
+                                    "market_id": market_id,
+                                    "token_id": token_id,
+                                    "side": side,
+                                    "price": order_info.get("price", 0),
+                                    "size": order_info.get("size", 0),
+                                    "cancel_requested_at": self._monotonic(),
+                                    "status": "CANCEL_PENDING",
+                                }
                                 
                                 # 从活跃订单中移除
                                 del self.active_orders[market_id][token_id][side]
