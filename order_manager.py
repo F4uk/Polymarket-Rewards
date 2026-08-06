@@ -3575,11 +3575,20 @@ class OrderManager:
                     cancel_response = self.clob_client.cancel_order(
                         OrderPayload(orderID=order_id)
                     )
-                    if (
-                        isinstance(cancel_response, dict)
-                        and cancel_response.get("success") is False
-                    ):
-                        raise ValueError("取消接口明确返回失败")
+                    if not isinstance(cancel_response, dict):
+                        raise ValueError("取消接口返回未知格式")
+                    canceled = cancel_response.get("canceled") or []
+                    not_canceled = cancel_response.get("not_canceled") or {}
+                    if not isinstance(canceled, (list, tuple, set)):
+                        raise ValueError("取消接口 canceled 字段格式异常")
+                    if not isinstance(not_canceled, dict):
+                        raise ValueError("取消接口 not_canceled 字段格式异常")
+                    if order_id in not_canceled:
+                        raise ValueError(
+                            f"取消接口明确返回失败: {not_canceled.get(order_id)}"
+                        )
+                    if order_id not in set(canceled):
+                        raise ValueError("取消接口未确认订单已取消")
                     result["buys_cancelled"] += 1
                     logger.info(f"启动对账：取消遗留 BUY {order_id}")
                 except Exception as e:

@@ -47,6 +47,7 @@ class FakeClobClient:
         self.fail_trades = False
         self.cancel_fail = False
         self.cancel_keep_order = False
+        self.cancel_not_canceled = False
         self.trade_pages: Optional[List[List[Dict[str, Any]]]] = None
 
     class _TradePage(list):
@@ -111,10 +112,15 @@ class FakeClobClient:
             order_id = getattr(payload, "order_id", None) or (
                 payload.get("order_id") if isinstance(payload, dict) else None
             )
+        if self.cancel_not_canceled:
+            return {
+                "canceled": [],
+                "not_canceled": {order_id: "simulated cancel rejection"},
+            }
         if not self.cancel_keep_order:
             self.open_orders = [o for o in self.open_orders if o.get("id") != order_id]
         self.cancelled.append(order_id)
-        return {"success": True}
+        return {"canceled": [order_id], "not_canceled": {}}
 
     def get_open_orders(self, params: Any = None) -> List[Dict[str, Any]]:
         if self.fail_open_orders:

@@ -343,3 +343,30 @@ def test_main_startup_reconciliation_exception_fails_closed():
     fake_om = SimpleNamespace(startup_open_orders_blocked=False)
     main_module._keep_startup_blocked(fake_om)
     assert fake_om.startup_open_orders_blocked is True
+
+
+def test_legacy_buy_not_canceled_response_keeps_block(fake_clock):
+    om, clob = _make_om(fake_clock)
+    om.get_positions = lambda **kwargs: []
+    clob.open_orders = [
+        {
+            "id": "buy-old",
+            "side": "BUY",
+            "token_id": TOKEN_A,
+            "price": 0.50,
+            "size": 100.0,
+            "filled": 0.0,
+            "remaining": 100.0,
+        }
+    ]
+    clob.cancel_not_canceled = True
+
+    result = om.reconcile_startup()
+    assert result["buy_cancellations_ok"] is False
+    assert result["buy_cancel_failures"] == 1
+    assert result["buys_cancelled"] == 0
+    assert om.startup_open_orders_blocked is True
+
+    assert om.maybe_reenter_markets([_market()]) == {}
+    assert len([c for c in clob.post_order_calls if c["order"].side == "BUY"]) == 0
+    assert om.retry_startup_reconciliation() is False
