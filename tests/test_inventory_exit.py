@@ -89,10 +89,22 @@ def test_limited_wait_timeout_goes_emergency(fake_clock):
 
     fake_clock.advance(100.0)  # beyond EXIT_MAX_HOLD_SECONDS
     om.api_client.orderbook_source.orderbooks[TOKEN_A] = _book(fake_clock, best_bid=0.58)
-    results = om.check_inventory_exits()
-    assert results[TOKEN_A] is False
-    assert om.inventory_exits[TOKEN_A]["state"] == "EMERGENCY_EXIT"
+    om.check_inventory_exits()
+    state = om.inventory_exits[TOKEN_A]
+    # 取消传播期间：保留旧订单身份，不得立即提交覆盖相同库存的新 SELL
+    assert state["state"] == "EMERGENCY_EXIT"
+    assert state["sell_order_status"] == "CANCEL_PENDING"
+    assert state["sell_order_id"] == passive_id
     assert passive_id in clob.cancelled
+    sells_after_cancel = [
+        c for c in clob.post_order_calls if c["order"].side == "SELL"
+    ]
+    assert len(sells_after_cancel) == 1  # 只有原来的被动卖单
+
+    # 取消确认后，只为剩余库存重新挂 SELL
+    om.check_inventory_exits()
+    state = om.inventory_exits[TOKEN_A]
+    assert state["sell_order_status"] in ("PENDING_CONFIRMATION", "LIVE")
     emergency = _sell_record(om)
     assert emergency["purpose"] == "EMERGENCY_EXIT"
     assert clob.post_order_calls[-1]["order"].price == 0.58
@@ -117,6 +129,16 @@ def test_bid_depth_drop_triggers_emergency(fake_clock):
 
     assert om.inventory_exits[TOKEN_A]["state"] == "EMERGENCY_EXIT"
     assert first_sell in clob.cancelled
+    assert om.inventory_exits[TOKEN_A]["sell_order_status"] == "CANCEL_PENDING"
+    assert om.inventory_exits[TOKEN_A]["sell_order_id"] == first_sell
+    # 取消传播期间不得提交覆盖相同库存的新 SELL
+    assert len([c for c in clob.post_order_calls if c["order"].side == "SELL"]) == 1
+
+    om.check_inventory_exits()
+    assert om.inventory_exits[TOKEN_A]["sell_order_status"] in (
+        "PENDING_CONFIRMATION",
+        "LIVE",
+    )
     assert _sell_record(om)["purpose"] == "EMERGENCY_EXIT"
     assert clob.post_order_calls[-1]["order"].price == 0.57
 
@@ -133,6 +155,8 @@ def test_spread_widening_triggers_emergency(monkeypatch, fake_clock):
     om.api_client.orderbook_source.orderbooks[TOKEN_A] = _book(fake_clock, best_bid=0.60, best_ask=0.68)
     om.check_inventory_exits()
     assert om.inventory_exits[TOKEN_A]["state"] == "EMERGENCY_EXIT"
+    assert om.inventory_exits[TOKEN_A]["sell_order_status"] == "CANCEL_PENDING"
+    om.check_inventory_exits()
     assert _sell_record(om)["purpose"] == "EMERGENCY_EXIT"
 
 

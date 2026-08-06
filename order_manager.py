@@ -127,6 +127,10 @@ class OrderManager:
         self.last_requote_cancel: Dict[str, float] = {}
         # 取消待确认订单：order_id -> info（取消传播期间继续处理成交差额）
         self.cancel_pending_tracking: Dict[str, Dict[str, Any]] = {}
+        # 启动时 open orders 查询失败标志：为 True 时禁止一切新 BUY
+        self.startup_open_orders_blocked = False
+        # 持仓微小差异连续确认：token_id -> count
+        self.position_diff_confirmations: Dict[str, int] = {}
         self._init_metrics()
         
         # WebSocket 相关初始化已移除，现在使用 HTTP 接口获取订单簿
@@ -622,6 +626,7 @@ class OrderManager:
             current["last_known_best_bid"] = best_bid
             if previous_bid is not None and best_bid < float(previous_bid) - 2.0 * tick_size:
                 current["_depth_dropped"] = True
+            current_state = current.get("state")
 
         emergency = force or loss_ticks >= config.exit_emergency_loss_ticks or (
             loss_bps >= config.exit_emergency_loss_bps
@@ -629,6 +634,11 @@ class OrderManager:
         now = self._monotonic()
         hold_seconds = now - float(state.get("first_fill_at", now))
         if hold_seconds >= config.exit_max_hold_seconds:
+            emergency = True
+        if (
+            current_state == "LIMITED_WAIT"
+            and hold_seconds >= config.exit_passive_wait_seconds
+        ):
             emergency = True
         if spread > (config.spread_range.get("max") or float("inf")):
             emergency = True
@@ -664,9 +674,10 @@ class OrderManager:
                 with self.lock:
                     current = self.inventory_exits.get(token_id)
                     if current is not None:
-                        current["sell_order_id"] = None
+                        # 取消传播期间保留旧订单身份与待确认份额：
+                        # 在确认取消前不得提交覆盖相同库存的新 SELL。
                         current["sell_order_status"] = "CANCEL_PENDING"
-                        current["pending_sell_size"] = 0.0
+                return
             exit_price = self.strategy.immediate_exit_price(best_bid, tick_size)
             self._submit_inventory_sell(
                 token_id, exit_price, state["remaining_size"], "EMERGENCY_EXIT"
@@ -799,10 +810,8 @@ class OrderManager:
             with self.lock:
                 state = self.inventory_exits.get(token_id)
                 if state is not None:
-                    state["sell_order_id"] = None
-                    state["sell_order_status"] = "CANCELLED"
-                    state["pending_sell_size"] = 0.0
-            self._process_inventory_exit(token_id)
+                    # 取消传播期间保留旧订单身份；确认取消后由下一次检查重新挂 SELL
+                    state["sell_order_status"] = "CANCEL_PENDING"
 
     def check_inventory_exits(self) -> Dict[str, bool]:
         """Process all tracked inventory: confirm sells and advance exit states."""
@@ -853,7 +862,12 @@ class OrderManager:
             open_ids = set()
         for market_id, token_id, side, info in pending:
             order_id = info.get("order_id")
-            submitted = float(info.get("submitted_at") or info.get("created_at") or now)
+            submitted_raw = info.get("submitted_at")
+            if submitted_raw is None:
+                submitted_raw = info.get("created_at_monotonic")
+            if submitted_raw is None:
+                submitted_raw = info.get("created_at")
+            submitted = float(submitted_raw if submitted_raw is not None else now)
             with self.lock:
                 current = (
                     self.active_orders.get(market_id, {})
@@ -925,22 +939,44 @@ class OrderManager:
                             unknowns.append((market_id, token_id, side, info))
         if not unknowns:
             return
+        open_orders_ok = True
+        positions_ok = True
+        trades_ok = True
         try:
             open_orders = self.clob_client.get_open_orders(OpenOrderParams()) or []
             open_ids = {o.get("id") for o in open_orders if o.get("id")}
-        except Exception:
+        except Exception as e:
+            logger.warning(f"UNKNOWN 对账：open orders 查询失败，保持 UNKNOWN: {e}")
+            open_orders_ok = False
             open_ids = set()
         try:
             positions = self.get_positions(size_threshold=0.1, limit=1000)
-        except Exception:
+        except Exception as e:
+            logger.warning(f"UNKNOWN 对账：positions 查询失败，保持 UNKNOWN: {e}")
+            positions_ok = False
             positions = []
         positions_by_token = {
             p.get("asset"): float(p.get("size", 0) or 0) for p in positions
         }
 
+        strict_filled: Dict[str, Optional[float]] = {}
         for market_id, token_id, side, info in unknowns:
             order_id = info.get("order_id")
-            filled = self._query_order_filled_size(order_id)
+            filled = self._query_order_filled_size_strict(order_id)
+            if filled is None:
+                trades_ok = False
+                break
+            strict_filled[order_id] = filled
+
+        if not (open_orders_ok and positions_ok and trades_ok):
+            logger.warning(
+                "UNKNOWN 对账存在查询失败：保持 UNKNOWN，不认定 FAILED，不重复提交 SELL"
+            )
+            return
+
+        for market_id, token_id, side, info in unknowns:
+            order_id = info.get("order_id")
+            filled = strict_filled.get(order_id, 0.0)
             with self.lock:
                 current = (
                     self.active_orders.get(market_id, {})
@@ -1141,20 +1177,21 @@ class OrderManager:
                         if token_id not in self.active_orders[market_id]:
                             self.active_orders[market_id][token_id] = {}
                         
-                    self.active_orders[market_id][token_id][side.upper()] = {
-                        "order_id": order_id,
-                        "token_id": token_id,
-                        "side": side.upper(),
-                        "price": price,
-                        "size": size,
-                        "exposure": exposure,
-                        "created_at": self._now(),
-                        "submitted_at": self._now(),
-                        "status": "PENDING_CONFIRMATION",
-                        "purpose": purpose,
-                        "generation": generation,
-                        "response": response
-                    }
+                        self.active_orders[market_id][token_id][side.upper()] = {
+                            "order_id": order_id,
+                            "token_id": token_id,
+                            "side": side.upper(),
+                            "price": price,
+                            "size": size,
+                            "exposure": exposure,
+                            "created_at": self._now(),  # 日志显示用 wall clock
+                            "created_at_monotonic": self._monotonic(),
+                            "submitted_at": self._monotonic(),
+                            "status": "PENDING_CONFIRMATION",
+                            "purpose": purpose,
+                            "generation": generation,
+                            "response": response
+                        }
                     self._record_order_fingerprint(
                         token_id, side, price, size, purpose, generation
                     )
@@ -1339,6 +1376,12 @@ class OrderManager:
         
         # HTTP 方式不需要等待，直接使用传入的订单簿数据
         token_ids = [token.get("token_id") for token in tokens if token.get("token_id")]
+
+        if self.startup_open_orders_blocked:
+            logger.warning(
+                f"启动对账未完成（open orders 查询失败），禁止为市场 {market_id} 挂 BUY"
+            )
+            return {token_id: False for token_id in token_ids}
         
         # 3. 更新市场数据缓存
         self.market_data_cache[market_id] = market
@@ -1444,7 +1487,7 @@ class OrderManager:
                     self.pending_reorder_tokens[token_id] = {
                         "market_id": market_id,
                         "side": "BUY",
-                        "last_attempt_time": self._now(),
+                        "last_attempt_time": self._monotonic(),
                         "target_price": None,
                         "order_size": order_size_for_entry,
                         "safety_info": {"reason": f"市场准入拒绝: {entry.reason}"},
@@ -1698,25 +1741,27 @@ class OrderManager:
         
         return results
     
-    def _query_order_filled_size(self, order_id: str) -> float:
+    def _query_order_filled_size_raw(self, order_id: str) -> float:
         """
-        查询订单的实际成交份额
+        查询订单的实际成交份额（不捕获异常）
         
-        通过交易历史累计所有相关交易的成交份额
+        通过交易历史分页累计所有相关交易的成交份额（单一累计成交入口）。
+        分页是必要的：只取第一页会把后续部分成交误判为已处理。
         
         Args:
             order_id: 订单ID
             
         Returns:
-            累计成交份额，如果查询失败返回0.0
+            累计成交份额
         """
-        try:
-            # 查询最近的交易历史
-            trades = self.clob_client.get_trades(TradeParams(), next_cursor="MA==")
-            
-            total_filled = 0.0
-            
-            # 遍历所有交易，累计该订单的成交份额
+        total_filled = 0.0
+        cursor = "MA=="
+        for _page in range(25):  # 有界分页，避免无限循环
+            trades = self.clob_client.get_trades(TradeParams(), next_cursor=cursor)
+            if not trades:
+                break
+
+            # 遍历本页交易，累计该订单的成交份额
             for trade in trades:
                 # 检查 taker_order_id
                 taker_order_id = trade.get("taker_order_id")
@@ -1724,7 +1769,7 @@ class OrderManager:
                     # 作为 taker 的成交份额
                     size = float(trade.get("size", 0))
                     total_filled += size
-                
+
                 # 检查 maker_orders 数组中的 order_id
                 maker_orders = trade.get("maker_orders", [])
                 if isinstance(maker_orders, list):
@@ -1734,11 +1779,33 @@ class OrderManager:
                             # 作为 maker 的成交份额
                             matched_amount = float(maker_order.get("matched_amount", 0))
                             total_filled += matched_amount
-            
-            return total_filled
+
+            next_cursor = None
+            if isinstance(trades, dict):
+                next_cursor = trades.get("next_cursor")
+            else:
+                next_cursor = getattr(trades, "next_cursor", None)
+            if not next_cursor or next_cursor == "LTE=":
+                break
+            cursor = next_cursor
+
+        return total_filled
+
+    def _query_order_filled_size(self, order_id: str) -> float:
+        """累计成交份额；查询失败返回 0.0（普通路径容错）。"""
+        try:
+            return self._query_order_filled_size_raw(order_id)
         except Exception as e:
             logger.warning(f"查询订单 {order_id[:20]}... 的成交份额失败: {e}")
             return 0.0
+
+    def _query_order_filled_size_strict(self, order_id: str) -> Optional[float]:
+        """累计成交份额；查询失败返回 None（用于 UNKNOWN 对账）。"""
+        try:
+            return self._query_order_filled_size_raw(order_id)
+        except Exception as e:
+            logger.warning(f"查询订单 {order_id[:20]}... 的成交份额失败（严格模式）: {e}")
+            return None
     
     def _track_partial_filled_order(
         self,
@@ -1762,7 +1829,7 @@ class OrderManager:
                 "filled_size": filled_size,
                 "hedged_size": 0.0,  # 已对冲卖出份额（初始为0）
                 "last_position": current_position,
-                "last_check_time": time.time(),
+                "last_check_time": self._monotonic(),
                 "market_id": order_info.get("market_id"),
                 "token_id": order_info.get("token_id"),
                 "price": order_info.get("price", 0)
@@ -1839,13 +1906,22 @@ class OrderManager:
                             )
                             
                             # 处理新增成交差额并进入分级库存退出
+                            # 注意：_handle_buy_fill 接收的是累计成交份额（单一累计入口），
+                            # 不能传入本轮新增差额，否则后续部分成交会被忽略。
                             try:
                                 hedge_result = self._handle_buy_fill(
                                     market_id=market_id,
                                     token_id=token_id,
                                     buy_price=price,
-                                    filled_size=new_filled_size
+                                    filled_size=new_total_filled
                                 )
+                                if new_filled_size > 0 and market_id:
+                                    # 新增成交差额的敞口只补记一次（挂单敞口已在首次部分成交时移除）
+                                    self.risk_manager.add_filled_order_exposure(
+                                        market_id,
+                                        price,
+                                        new_filled_size,
+                                    )
                                 if hedge_result:
                                     # 更新跟踪信息（使用锁保护）
                                     with self.lock:
@@ -1853,7 +1929,7 @@ class OrderManager:
                                             tracking_info = self.partial_filled_tracking[order_id]
                                             tracking_info["filled_size"] = new_total_filled
                                             tracking_info["last_position"] = current_position
-                                            tracking_info["last_check_time"] = time.time()
+                                            tracking_info["last_check_time"] = self._monotonic()
                                             tracking_info["hedged_size"] = hedged_size + new_filled_size
                                     logger.info(
                                         f"部分成交订单新增部分对冲卖出成功: 订单ID={order_id[:20]}..., "
@@ -1866,7 +1942,7 @@ class OrderManager:
                                             tracking_info = self.partial_filled_tracking[order_id]
                                             tracking_info["filled_size"] = new_total_filled
                                             tracking_info["last_position"] = current_position
-                                            tracking_info["last_check_time"] = time.time()
+                                            tracking_info["last_check_time"] = self._monotonic()
                                     logger.warning(
                                         f"部分成交订单新增部分对冲卖出失败: 订单ID={order_id[:20]}..."
                                     )
@@ -1877,7 +1953,7 @@ class OrderManager:
                                         tracking_info = self.partial_filled_tracking[order_id]
                                         tracking_info["filled_size"] = new_total_filled
                                         tracking_info["last_position"] = current_position
-                                        tracking_info["last_check_time"] = time.time()
+                                        tracking_info["last_check_time"] = self._monotonic()
                                 logger.error(f"部分成交订单新增部分对冲卖出时发生错误: {e}")
                             
                             # 检查是否完全成交
@@ -1893,7 +1969,7 @@ class OrderManager:
                                 if order_id in self.partial_filled_tracking:
                                     tracking_info = self.partial_filled_tracking[order_id]
                                     tracking_info["last_position"] = current_position
-                                    tracking_info["last_check_time"] = time.time()
+                                    tracking_info["last_check_time"] = self._monotonic()
                             
                             # 检查是否完全成交（通过累计成交份额判断）
                             if actual_filled_size >= original_size:
@@ -2334,14 +2410,9 @@ class OrderManager:
                                         
                                         # 如果是买单部分成交，需要将已成交部分的敞口从挂单敞口转为已成交订单敞口
                                         if side == "BUY":
-                                            # 移除整个挂单的敞口
-                                            self.risk_manager.remove_exposure(market_id, order_info.get("exposure", 0))
-                                            # 添加已成交部分的敞口（占用资金，计入总敞口）
-                                            self.risk_manager.add_filled_order_exposure(
-                                                market_id,
-                                                order_info.get("price", 0),
-                                                filled_size
-                                            )
+                                            # 敞口转换统一由下方 risk_updates 处理一次，
+                                            # 避免部分成交敞口被更新两次。
+                                            pass
                                             
                                             # 收集需要处理对冲卖出的订单信息（部分成交）
                                             order_info["filled_size"] = filled_size
@@ -3446,12 +3517,20 @@ class OrderManager:
             "buys_cancelled": 0,
             "sells_imported": 0,
             "positions_imported": 0,
+            "open_orders_query_ok": False,
+            "positions_query_ok": False,
         }
         try:
             open_orders = self.clob_client.get_open_orders(OpenOrderParams()) or []
+            result["open_orders_query_ok"] = True
+            self.startup_open_orders_blocked = False
         except Exception as e:
             logger.error(f"启动对账：获取活跃订单失败: {e}")
-            open_orders = []
+            # 查询失败不得被解释为空结果：阻断新 BUY，跳过订单导入
+            self.startup_open_orders_blocked = True
+            result["open_orders_query_ok"] = False
+            logger.info("启动对账：open orders 查询失败，阻断新 BUY")
+            return result
         result["open_orders"] = len(open_orders)
 
         for order in open_orders:
@@ -3483,7 +3562,8 @@ class OrderManager:
                         "size": size,
                         "exposure": 0.0,
                         "created_at": self._now(),
-                        "submitted_at": self._now(),
+                        "created_at_monotonic": self._monotonic(),
+                        "submitted_at": self._monotonic(),
                         "status": "LIVE",
                         "purpose": "RECONCILED_EXIT",
                         "generation": 0,
@@ -3493,9 +3573,12 @@ class OrderManager:
 
         try:
             positions = self.get_positions(size_threshold=0.1, limit=1000)
+            result["positions_query_ok"] = True
         except Exception as e:
             logger.warning(f"启动对账：获取持仓失败: {e}")
             positions = []
+            result["positions_query_ok"] = False
+            logger.info("启动对账：positions 查询失败，不视为空持仓")
         for position in positions:
             token_id = position.get("asset")
             size = float(position.get("size", 0) or 0)
@@ -3515,6 +3598,17 @@ class OrderManager:
         logger.info(f"启动对账完成: {result}")
         return result
 
+    def retry_startup_reconciliation(self) -> bool:
+        """重试启动时的 open orders 查询；成功后解除新 BUY 阻断。"""
+        try:
+            self.clob_client.get_open_orders(OpenOrderParams())
+        except Exception as e:
+            logger.warning(f"重试启动对账失败，继续阻断新 BUY: {e}")
+            return False
+        self.startup_open_orders_blocked = False
+        logger.info("重试启动对账成功，解除新 BUY 阻断")
+        return True
+
     def maybe_reenter_markets(
         self,
         markets: List[Dict[str, Any]],
@@ -3524,6 +3618,9 @@ class OrderManager:
         Every reentry runs the full market-entry gate on a fresh book.
         """
         results: Dict[str, bool] = {}
+        if self.startup_open_orders_blocked:
+            logger.warning("启动对账未完成（open orders 查询失败），跳过 reentry BUY")
+            return results
         for market in markets:
             market_id = market.get("market_id")
             rewards_max_spread = market.get("rewards_max_spread", 0)
@@ -3939,7 +4036,12 @@ class OrderManager:
                     if price_diff < tick_size * max(1, config.requote_min_ticks) - 1e-9:
                         # 变化不足（含相同价格），不撤挂
                         continue
-                    if self._monotonic() - float(current_created_at or 0) < config.min_quote_lifetime_seconds:
+                    lifetime_start = order_info.get("created_at_monotonic")
+                    if lifetime_start is None:
+                        lifetime_start = order_info.get("submitted_at")
+                    if lifetime_start is None:
+                        lifetime_start = current_created_at
+                    if self._monotonic() - float(lifetime_start or 0) < config.min_quote_lifetime_seconds:
                         continue
                     with self.lock:
                         last_cancel = self.last_requote_cancel.get(token_id, 0.0)
@@ -4082,7 +4184,7 @@ class OrderManager:
                         ):
                             with self.lock:
                                 if token_id in self.pending_reorder_tokens:
-                                    self.pending_reorder_tokens[token_id]["last_attempt_time"] = self._now()
+                                    self.pending_reorder_tokens[token_id]["last_attempt_time"] = self._monotonic()
                             continue
                         # 获取奖励区间边界
                         buy_price = prices.get("buy_price")
@@ -4164,30 +4266,35 @@ class OrderManager:
                                 # target_price 已经在上面计算好了（使用 actual_buy_price），继续使用它
                                 # 注意：target_price 现在已经是规范化后的 actual_buy_price（买二价或奖励下边界）
                         else:
-                            # 无法获取奖励区间，使用目标价格
-                            # 买单向下取整，卖单向上取整（由 place_order 统一处理）
-                            if side == "SELL":
-                                market = self.market_data_cache.get(market_id)
-                                target_price = self.strategy.normalize_price(
-                                    target_price,
-                                    self.strategy.get_order_price_min_tick_size(market)
-                                )
+                            # 无法获取奖励区间边界：不得使用旧目标价格挂 BUY
+                            with self.lock:
+                                self.pending_reorder_tokens[token_id] = {
+                                    "market_id": market_id,
+                                    "side": side,
+                                    "last_attempt_time": self._monotonic(),
+                                    "target_price": None,
+                                    "order_size": order_size_for_check or current_size,
+                                    "safety_info": {"reason": "无法计算奖励区间边界"},
+                                }
                             logger.warning(
-                                f"  警告：无法获取奖励区间边界，使用目标价格 {target_price:.4f} 重新挂单。"
+                                f"  警告：无法获取奖励区间边界，跳过重新挂单（不使用旧价格）。"
                             )
+                            continue
                     else:
-                        # 如果无法获取订单簿，记录警告但继续挂单（使用保守策略）
+                        # 没有订单簿：跳过重新挂单，不得使用旧目标价格
+                        with self.lock:
+                            self.pending_reorder_tokens[token_id] = {
+                                "market_id": market_id,
+                                "side": side,
+                                "last_attempt_time": self._monotonic(),
+                                "target_price": None,
+                                "order_size": order_size_for_check or current_size,
+                                "safety_info": {"reason": "无法获取订单簿"},
+                            }
                         logger.warning(
-                            f"  警告：无法获取最新订单簿数据，无法进行安全挂单检查。"
-                            f"将使用目标价格 {target_price:.4f} 重新挂单。"
+                            f"  警告：无法获取最新订单簿数据，跳过重新挂单（不使用旧价格）。"
                         )
-                        # 买单向下取整，卖单向上取整（由 place_order 统一处理）
-                        if side == "SELL":
-                            market = self.market_data_cache.get(market_id)
-                            target_price = self.strategy.normalize_price(
-                                target_price,
-                                self.strategy.get_order_price_min_tick_size(market)
-                            )
+                        continue
                 else:
                     # 卖单不需要检查，直接使用目标价格（需要规范化）
                     market = self.market_data_cache.get(market_id)
@@ -4292,6 +4399,18 @@ class OrderManager:
                         # 如果批量获取的数据中没有，才单独获取
                         current_orderbook = self._get_orderbook(token_id)
                     if current_orderbook:
+                        # 新鲜度检查：过期订单簿不用于恢复 BUY
+                        current_normalized = normalize_orderbook(
+                            current_orderbook, now_monotonic=self._monotonic()
+                        )
+                        if (
+                            current_normalized.age_seconds is None
+                            or current_normalized.age_seconds > config.max_orderbook_age_seconds
+                        ):
+                            with self.lock:
+                                if token_id in self.pending_reorder_tokens:
+                                    self.pending_reorder_tokens[token_id]["last_attempt_time"] = self._monotonic()
+                            continue
                         # 获取奖励区间边界
                         buy_price = prices.get("buy_price") if prices else target_price
                         sell_price = prices.get("sell_price") if prices else None
@@ -4343,30 +4462,27 @@ class OrderManager:
                             else:
                                 logger.info(f"  风险管理检查通过: {safety_info['reason']}，可以重新挂单")
                         else:
-                            # 无法获取奖励区间，使用目标价格
-                            # 买单向下取整，卖单向上取整（由 place_order 统一处理）
-                            if side == "SELL":
-                                market = self.market_data_cache.get(market_id)
-                                target_price = self.strategy.normalize_price(
-                                    target_price,
-                                    self.strategy.get_order_price_min_tick_size(market)
-                                )
+                            # 无法获取奖励区间边界：不得使用旧目标价格挂 BUY
+                            with self.lock:
+                                if token_id in self.pending_reorder_tokens:
+                                    self.pending_reorder_tokens[token_id]["last_attempt_time"] = self._monotonic()
+                                    self.pending_reorder_tokens[token_id]["target_price"] = None
+                                    self.pending_reorder_tokens[token_id]["safety_info"] = {"reason": "无法计算奖励区间边界"}
                             logger.warning(
-                                f"  警告：无法获取奖励区间边界，使用目标价格 {target_price:.4f} 重新挂单。"
+                                f"  警告：无法获取奖励区间边界，跳过重新挂单（不使用旧价格）。"
                             )
+                            continue
                     else:
-                        # 如果无法获取订单簿，记录警告但继续挂单（使用保守策略）
+                        # 没有订单簿：跳过重新挂单，不得使用旧目标价格
+                        with self.lock:
+                            if token_id in self.pending_reorder_tokens:
+                                self.pending_reorder_tokens[token_id]["last_attempt_time"] = self._monotonic()
+                                self.pending_reorder_tokens[token_id]["target_price"] = None
+                                self.pending_reorder_tokens[token_id]["safety_info"] = {"reason": "无法获取订单簿"}
                         logger.warning(
-                            f"  警告：无法获取最新订单簿数据，无法进行安全挂单检查。"
-                            f"将使用目标价格 {target_price:.4f} 重新挂单。"
+                            f"  警告：无法获取最新订单簿数据，跳过重新挂单（不使用旧价格）。"
                         )
-                        # 买单向下取整，卖单向上取整（由 place_order 统一处理）
-                        if side == "SELL":
-                            market = self.market_data_cache.get(market_id)
-                            target_price = self.strategy.normalize_price(
-                                target_price,
-                                self.strategy.get_order_price_min_tick_size(market)
-                            )
+                        continue
                 else:
                     # 卖单不需要检查买一价，需要规范化
                     market = self.market_data_cache.get(market_id)

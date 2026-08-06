@@ -199,6 +199,10 @@ def main():
                 f"导入卖单={startup_reconciliation['sells_imported']}, "
                 f"导入持仓={startup_reconciliation['positions_imported']}"
             )
+            if not startup_reconciliation.get("open_orders_query_ok", True):
+                logger.warning(
+                    "启动对账：open orders 查询失败，本轮阻断所有新 BUY"
+                )
         except Exception as e:
             logger.warning(f"启动对账时发生错误: {e}，继续运行")
         
@@ -233,9 +237,9 @@ def main():
             if len(selected_markets) > 5:
                 logger.info(f"  ... 还有 {len(selected_markets) - 5} 个市场")
             
-            # 为选中的市场挂单
-            # 注意：不再一次性获取所有订单簿数据，而是在每个市场挂单前实时获取
-            # 这样可以避免在挂单过程中使用过期的订单簿数据
+            # 为选中的市场挂单（open orders 查询失败时跳过，不允许新 BUY）
+            if order_manager.startup_open_orders_blocked:
+                logger.warning("启动对账被阻断，跳过初始挂单（后续主循环重试）")
             logger.info("=" * 60)
             logger.info("开始为机会市场挂单...")
             logger.info("=" * 60)
@@ -245,7 +249,7 @@ def main():
             orderbooks_dict = {}
             
             for idx, market in enumerate(selected_markets, 1):
-                if not running:
+                if not running or order_manager.startup_open_orders_blocked:
                     break
                 
                 market_id = market.get("market_id")
@@ -366,6 +370,8 @@ def main():
 
                         # 库存清仓并冷却结束后，重新执行完整准入后恢复 BUY
                         try:
+                            if order_manager.startup_open_orders_blocked:
+                                order_manager.retry_startup_reconciliation()
                             reentry_results = order_manager.maybe_reenter_markets(
                                 market_manager.get_selected_markets()
                             )

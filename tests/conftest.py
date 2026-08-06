@@ -88,6 +88,7 @@ def make_order_manager(
     om.inventory_generations = {}
     om.last_requote_cancel = {}
     om.cancel_pending_tracking = {}
+    om.startup_open_orders_blocked = False
     om.metrics = {}
     om.lock = threading.RLock()
     om._now = clock.time
@@ -118,7 +119,10 @@ def register_fake_orders(om: Any, orders: Dict[str, Dict[str, Any]]) -> None:
                 "size": info.get("size", 100.0),
                 "exposure": info.get("exposure", 0.0),
                 "created_at": info.get("created_at", om._now()),
+                "created_at_monotonic": info.get(
+                    "created_at_monotonic", om._monotonic()
+                ),
+                "submitted_at": info.get("submitted_at", om._monotonic()),
                 "purpose": info.get("purpose", "REWARD_BUY"),
                 "status": info.get("status", "PENDING_CONFIRMATION"),
-                "submitted_at": info.get("submitted_at", om._now()),
             }

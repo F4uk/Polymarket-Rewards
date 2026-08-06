@@ -50,6 +50,8 @@ def _make_om(clock, book, current_price=0.58, created_at=None, size=100.0):
         "exposure": current_price * size,
         # 默认让订单足够“老”，以便普通重新报价门槛只由测试意图控制
         "created_at": created_at if created_at is not None else clock.monotonic() - 60.0,
+        "created_at_monotonic": created_at if created_at is not None else clock.monotonic() - 60.0,
+        "submitted_at": created_at if created_at is not None else clock.monotonic() - 60.0,
         "submitted_at": clock.monotonic(),
         "status": "LIVE",
         "purpose": "REWARD_BUY",
@@ -121,7 +123,10 @@ def test_requote_cooldown(fake_clock):
     _adjust(om)
     assert clob.cancelled == ["buy-1"]
     # Immediately ask for another move; cooldown must block it.
-    om.active_orders["market-1"][TOKEN_A]["BUY"]["created_at"] = fake_clock.monotonic()
+    now = fake_clock.monotonic()
+    om.active_orders["market-1"][TOKEN_A]["BUY"]["created_at"] = now
+    om.active_orders["market-1"][TOKEN_A]["BUY"]["created_at_monotonic"] = now
+    om.active_orders["market-1"][TOKEN_A]["BUY"]["submitted_at"] = now
     moved = _book(fake_clock, bids=[
         {"price": "0.62", "size": "200"},
         {"price": "0.61", "size": "200"},
@@ -150,6 +155,8 @@ def test_new_order_lifetime(fake_clock):
         "size": 100.0,
         "exposure": 59.0,
         "created_at": fake_clock.monotonic(),
+        "created_at_monotonic": fake_clock.monotonic(),
+        "submitted_at": fake_clock.monotonic(),
         "submitted_at": fake_clock.monotonic(),
         "status": "LIVE",
         "purpose": "REWARD_BUY",
@@ -244,6 +251,7 @@ def test_pending_reorder_cooldown_then_retry(fake_clock):
     # Cooldown (5s) not elapsed yet.
     assert "BUY" not in om.active_orders.get("market-1", {}).get(TOKEN_A, {})
     fake_clock.advance(6.0)
+    om.api_client.orderbook_source.orderbooks[TOKEN_A] = _book(fake_clock)
     _adjust(om)
     assert "BUY" in om.active_orders["market-1"][TOKEN_A]
     assert TOKEN_A not in om.pending_reorder_tokens

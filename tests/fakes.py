@@ -10,9 +10,14 @@ from py_clob_client_v2.clob_types import OrderArgs
 class FakeClock:
     """Deterministic wall-clock and monotonic-clock source."""
 
-    def __init__(self, start: float = 1_000_000.0):
-        self.wall = start
-        self.mono = start
+    def __init__(
+        self,
+        start: float = 1_000_000.0,
+        wall_start: Optional[float] = None,
+        mono_start: Optional[float] = None,
+    ):
+        self.wall = start if wall_start is None else wall_start
+        self.mono = start if mono_start is None else mono_start
 
     def time(self) -> float:
         return self.wall
@@ -38,6 +43,12 @@ class FakeClobClient:
         self.next_order_id = 1
         self.fail_post: Optional[Exception] = None
         self.respond_success = True
+        self.fail_open_orders = False
+        self.fail_trades = False
+        self.trade_pages: Optional[List[List[Dict[str, Any]]]] = None
+
+    class _TradePage(list):
+        pass
 
     # ------------------------------------------------------------------
     # Credentials / setup
@@ -101,9 +112,25 @@ class FakeClobClient:
         return {"success": True}
 
     def get_open_orders(self, params: Any = None) -> List[Dict[str, Any]]:
+        if self.fail_open_orders:
+            raise RuntimeError("simulated open orders failure")
         return list(self.open_orders)
 
     def get_trades(self, params: Any = None, next_cursor: Optional[str] = None) -> List[Dict[str, Any]]:
+        if self.fail_trades:
+            raise RuntimeError("simulated trades failure")
+        if self.trade_pages is not None:
+            if next_cursor in (None, "MA=="):
+                index = 0
+            else:
+                index = int(str(next_cursor).replace("page", ""))
+            if index >= len(self.trade_pages):
+                return []
+            page = self._TradePage(self.trade_pages[index])
+            page.next_cursor = (
+                f"page{index + 1}" if index + 1 < len(self.trade_pages) else None
+            )
+            return page
         return list(self.trades)
 
     # ------------------------------------------------------------------
