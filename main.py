@@ -26,6 +26,12 @@ running = True
 shutdown_event = threading.Event()
 
 
+def _keep_startup_blocked(order_manager):
+    """启动对账异常时失败关闭：保持新 BUY 阻断。"""
+    order_manager.startup_open_orders_blocked = True
+    logger.warning("启动对账异常，保持新 BUY 阻断")
+
+
 def signal_handler(signum, frame):
     """信号处理器，用于优雅关闭"""
     global running
@@ -204,7 +210,8 @@ def main():
                     "启动对账：open orders 查询失败，本轮阻断所有新 BUY"
                 )
         except Exception as e:
-            logger.warning(f"启动对账时发生错误: {e}，继续运行")
+            logger.warning(f"启动对账时发生错误: {e}")
+            _keep_startup_blocked(order_manager)
         
         # 3. 初始市场扫描和筛选
         logger.info("=" * 60)

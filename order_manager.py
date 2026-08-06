@@ -3543,6 +3543,8 @@ class OrderManager:
             "positions_imported": 0,
             "open_orders_query_ok": False,
             "positions_query_ok": False,
+            "buy_cancellations_ok": True,
+            "buy_cancel_failures": 0,
         }
         try:
             open_orders = self.clob_client.get_open_orders(OpenOrderParams()) or []
@@ -3557,6 +3559,7 @@ class OrderManager:
             return result
         result["open_orders"] = len(open_orders)
 
+        saw_legacy_buy = False
         for order in open_orders:
             order_id = order.get("id")
             if not order_id:
@@ -3567,12 +3570,22 @@ class OrderManager:
             size = float(order.get("size", 0) or 0)
 
             if side == "BUY":
+                saw_legacy_buy = True
                 try:
-                    self.clob_client.cancel_order(OrderPayload(orderID=order_id))
+                    cancel_response = self.clob_client.cancel_order(
+                        OrderPayload(orderID=order_id)
+                    )
+                    if (
+                        isinstance(cancel_response, dict)
+                        and cancel_response.get("success") is False
+                    ):
+                        raise ValueError("取消接口明确返回失败")
                     result["buys_cancelled"] += 1
                     logger.info(f"启动对账：取消遗留 BUY {order_id}")
                 except Exception as e:
                     logger.warning(f"启动对账：取消遗留 BUY 失败 {order_id}: {e}")
+                    result["buy_cancellations_ok"] = False; result["buy_cancel_failures"] += 1
+                    self.startup_open_orders_blocked = True
             elif side == "SELL" and token_id:
                 market_id = self._get_market_id_from_token_id(token_id) or "unknown"
                 with self.lock:
@@ -3594,6 +3607,25 @@ class OrderManager:
                         "response": {"status": "live"},
                     }
                 result["sells_imported"] += 1
+
+        if saw_legacy_buy:
+            try:
+                rechecked = self.clob_client.get_open_orders(OpenOrderParams()) or []
+                remaining_buys = [
+                    o
+                    for o in rechecked
+                    if str(o.get("side", "")).upper() == "BUY"
+                ]
+                if remaining_buys:
+                    result["buy_cancellations_ok"] = False
+                    self.startup_open_orders_blocked = True
+                    logger.warning(
+                        f"启动对账：取消后仍存在 {len(remaining_buys)} 个遗留 BUY"
+                    )
+            except Exception as e:
+                result["buy_cancellations_ok"] = False
+                self.startup_open_orders_blocked = True
+                logger.warning(f"启动对账：取消后复查 open orders 失败: {e}")
 
         positions = self._get_positions_strict(size_threshold=0.1, limit=1000)
         if positions is None:
@@ -3633,6 +3665,7 @@ class OrderManager:
         if not (
             result.get("open_orders_query_ok")
             and result.get("positions_query_ok")
+            and result.get("buy_cancellations_ok")
         ):
             self.startup_open_orders_blocked = True
             logger.warning("重试启动对账未全部成功，继续阻断新 BUY")
