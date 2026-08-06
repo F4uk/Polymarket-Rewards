@@ -468,6 +468,8 @@ class OrderManager:
             state = self.inventory_exits.get(token_id)
             if state is None:
                 return
+            market_id = state.get("market_id")
+            sell_id = state.get("sell_order_id")
             state["state"] = "FLAT"
             state["flat_at"] = self._monotonic()
             state["sell_order_id"] = None
@@ -487,7 +489,22 @@ class OrderManager:
                 (previous_avg * flat_count + hold_seconds) / (flat_count + 1)
             )
             self.metrics["positions_flat"] += 1
+        if market_id:
+            self._clear_active_sell(market_id, token_id, sell_id)
         logger.info(f"库存已清: token={token_id[:20]}... 原因={reason or '全部卖出'}")
+
+    def _clear_active_sell(
+        self,
+        market_id: str,
+        token_id: str,
+        order_id: Optional[str] = None,
+    ) -> None:
+        """Remove a SELL record from active_orders (inventory state preserved)."""
+        with self.lock:
+            sides = self.active_orders.get(market_id, {}).get(token_id)
+            if sides and "SELL" in sides:
+                if order_id is None or sides["SELL"].get("order_id") == order_id:
+                    del sides["SELL"]
 
     def _submit_inventory_sell(
         self,
@@ -723,6 +740,8 @@ class OrderManager:
                     max(0.0, float(current.get("entry_price", 0.0)) - last_bid) * delta
                 )
             if current["remaining_size"] <= config.position_dust_size:
+                flat_market_id = current.get("market_id")
+                flat_sell_id = current.get("sell_order_id")
                 current["state"] = "FLAT"
                 current["flat_at"] = self._monotonic()
                 current["sell_order_id"] = None
@@ -742,6 +761,8 @@ class OrderManager:
                 )
                 self.metrics["positions_flat"] += 1
                 logger.info(f"SELL 成交确认，库存已清: token={token_id[:20]}...")
+                if flat_market_id:
+                    self._clear_active_sell(flat_market_id, token_id, flat_sell_id)
                 return
             if (
                 current.get("sell_order_status") == "PENDING_CONFIRMATION"
@@ -960,9 +981,14 @@ class OrderManager:
                     if side == "SELL":
                         state = self.inventory_exits.get(token_id)
                         if state and state.get("sell_order_id") == order_id:
+                            state_market_id = state.get("market_id")
                             state["sell_order_id"] = None
                             state["sell_order_status"] = "FAILED"
                             state["pending_sell_size"] = 0.0
+                            if state_market_id:
+                                self._clear_active_sell(
+                                    state_market_id, token_id, order_id
+                                )
                     logger.warning(
                         f"UNKNOWN 订单对账认定为失败（无订单/无成交/无持仓）: order_id={order_id}"
                     )
@@ -1001,6 +1027,9 @@ class OrderManager:
                         )
                     else:
                         self._confirm_inventory_sells(track["token_id"])
+                        self._clear_active_sell(
+                            track["market_id"], track["token_id"], order_id
+                        )
                 self.cancel_pending_tracking.pop(order_id, None)
             logger.info(f"取消已确认: order_id={order_id}")
     
