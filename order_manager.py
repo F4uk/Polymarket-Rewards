@@ -669,40 +669,47 @@ class OrderManager:
             
             # 强制实时获取订单簿数据（避免使用过期数据造成损失）
             orderbook = self._get_orderbook(token_id)
-            use_conservative_price = False  # 是否使用保守价格
-            
-            # 如果实时获取失败，尝试使用备选数据源（但使用保守价格并记录警告）
+
+            # 实时获取失败时不再使用备选旧数据或虚构保守价格：直接跳过挂单
             if not orderbook:
                 logger.warning(
                     f"市场 {market_id} token {outcome} 实时获取订单簿失败，"
-                    f"尝试使用备选数据源（可能已过期）"
+                    f"跳过挂单（不使用过期或虚构订单簿）"
                 )
-                orderbook = orderbooks_dict.get(token_id)
-                if orderbook:
-                    # 使用备选数据源时，强制使用保守价格（在边界基础上再向外偏移，降低被成交风险）
-                    use_conservative_price = True
-                    logger.warning(
-                        f"市场 {market_id} token {outcome} 使用备选订单簿数据（可能已过期），"
-                        f"将使用保守价格下单（降低被成交风险），等待主循环调整"
-                    )
-                else:
-                    logger.error(f"市场 {market_id} token {outcome} 没有可用的订单簿数据，跳过挂单")
-                    # 如果需要双边挂单但某个 token 没有数据，记录警告
-                    if requires_both_tokens:
-                        logger.error(
-                            f"  ⚠️  警告：需要双边挂单，但 token {outcome} 没有订单簿数据，"
-                            f"可能无法获得奖励"
-                        )
-                    results[token_id] = False
-                    continue
+                results[token_id] = False
+                continue
             else:
                 logger.info(f"市场 {market_id} token {outcome} 使用实时订单簿数据")
+
+            # 完整市场准入（新鲜度、最差边点差、保护深度、退出能力）
+            order_size_for_entry = self.strategy.calculate_order_size(market)
+            entry = self.strategy.evaluate_token_entry(
+                token_id,
+                orderbook,
+                market=market,
+                order_size=order_size_for_entry,
+                now_monotonic=self._monotonic(),
+            )
+            if not entry.accepted:
+                logger.warning(
+                    f"市场 {market_id} token {outcome} 未通过市场准入: {entry.reason}，跳过挂单"
+                )
+                results[token_id] = False
+                with self.lock:
+                    self.pending_reorder_tokens[token_id] = {
+                        "market_id": market_id,
+                        "side": "BUY",
+                        "last_attempt_time": self._now(),
+                        "target_price": None,
+                        "order_size": order_size_for_entry,
+                        "safety_info": {"reason": f"市场准入拒绝: {entry.reason}"},
+                    }
+                continue
             
-            # 计算订单价格（奖励区间边界，如果数据过期则使用保守价格）
+            # 计算订单价格（奖励区间边界）
             prices = self.strategy.calculate_order_prices(
                 orderbook, 
                 rewards_max_spread,
-                use_conservative_price=use_conservative_price,
                 market=market
             )
             if not prices:

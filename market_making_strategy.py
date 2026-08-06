@@ -11,6 +11,30 @@ from logger import setup_logger
 
 logger = setup_logger("market_making_strategy")
 
+# 市场准入原因代码
+ENTRY_ACCEPTED = "ACCEPTED"
+ENTRY_STALE_BOOK = "STALE_BOOK"
+ENTRY_EMPTY_BOOK = "EMPTY_BOOK"
+ENTRY_ONE_SIDED_BOOK = "ONE_SIDED_BOOK"
+ENTRY_CROSSED_BOOK = "CROSSED_BOOK"
+ENTRY_SPREAD_TOO_WIDE = "SPREAD_TOO_WIDE"
+ENTRY_NO_SECOND_BID = "NO_SECOND_BID"
+ENTRY_INSUFFICIENT_PROTECTION = "INSUFFICIENT_PROTECTION"
+ENTRY_INSUFFICIENT_EXIT_DEPTH = "INSUFFICIENT_EXIT_DEPTH"
+ENTRY_EXIT_VWAP_TOO_LOSSY = "EXIT_VWAP_TOO_LOSSY"
+ENTRY_PRICE_CLIFF = "PRICE_CLIFF"
+ENTRY_INVALID_BOOK = "INVALID_BOOK"
+
+
+@dataclass
+class EntryDecision:
+    """Result of one market/token entry evaluation."""
+
+    accepted: bool
+    reason: str = ENTRY_INVALID_BOOK
+    token_id: Optional[str] = None
+    details: dict = field(default_factory=dict)
+
 
 def reward_spread_decimal(
     rewards_max_spread: float,
@@ -415,7 +439,6 @@ class MarketMakingStrategy:
         self,
         orderbook: Dict[str, Any],
         rewards_max_spread: float,
-        use_conservative_price: bool = False,
         market: Optional[Dict[str, Any]] = None
     ) -> Optional[Dict[str, float]]:
         """
@@ -424,7 +447,6 @@ class MarketMakingStrategy:
         Args:
             orderbook: 订单簿数据
             rewards_max_spread: 奖励最大价差（美分）
-            use_conservative_price: 是否使用保守价格（数据过期时使用，使用极低/极高价格避免成交）
             market: 市场数据字典（可选，用于获取 orderPriceMinTickSize）
             
         Returns:
@@ -432,21 +454,6 @@ class MarketMakingStrategy:
         """
         # 获取市场的最小价格步长
         tick_size = self.get_order_price_min_tick_size(market)
-        
-        # 如果使用保守价格（数据过期时），使用极低/极高价格，几乎不会被成交
-        if use_conservative_price:
-            buy_price = 0.01  # 极低价格，几乎不会被成交
-            sell_price = 0.99  # 极高价格，几乎不会被成交
-            logger.debug(
-                f"使用保守价格（数据过期）: 买入价={buy_price:.2f}, 卖出价={sell_price:.2f}"
-            )
-            return {
-                "mid_price": 0.50,  # 占位值，实际不使用
-                "buy_price": buy_price,
-                "sell_price": sell_price,
-                "reward_min_price": buy_price,
-                "reward_max_price": sell_price
-            }
         
         mid_price = self.calculate_mid_price(orderbook)
         if mid_price is None:
@@ -468,6 +475,195 @@ class MarketMakingStrategy:
             "reward_min_price": buy_price,
             "reward_max_price": sell_price
         }
+
+    def _simulate_exit(
+        self,
+        normalized_bids: list,
+        order_size: float,
+        entry_price: float,
+        min_depth_multiplier: float,
+        price_cliff_threshold: float,
+    ) -> dict:
+        """Simulate selling ``order_size`` against the bid book.
+
+        Returns coverage, VWAP, worst price, tick/bps loss, depth multiplier,
+        and whether an obvious price cliff must be crossed.
+        """
+        needed = max(0.0, float(order_size)) * float(min_depth_multiplier)
+        cumulative = 0.0
+        weighted = 0.0
+        worst_price = None
+        levels_needed = 0
+        cliff_detected = False
+        previous_price = None
+
+        for price, size in normalized_bids:
+            if previous_price is not None:
+                gap = previous_price - price
+                if gap > price_cliff_threshold:
+                    cliff_detected = True
+            previous_price = price
+
+            take = min(size, max(0.0, needed - cumulative))
+            if take <= 0:
+                break
+            cumulative += take
+            weighted += take * price
+            worst_price = price
+            levels_needed += 1
+
+        vwap = (weighted / cumulative) if cumulative > 0 else 0.0
+        loss_per_unit = float(entry_price) - vwap
+        loss_ticks = 0.0
+        if loss_per_unit > 0:
+            # 使用 0.01 作为 loss_ticks 的基准单位（tick 损失按价格差/0.01 计）
+            loss_ticks = loss_per_unit / 0.01
+        loss_bps = (loss_per_unit / float(entry_price) * 10000.0) if entry_price > 0 else 0.0
+        depth_multiplier = (cumulative / float(order_size)) if order_size > 0 else 0.0
+
+        return {
+            "needed": needed,
+            "cumulative_size": cumulative,
+            "levels_needed": levels_needed,
+            "vwap": vwap,
+            "worst_fill_price": worst_price,
+            "loss_ticks": max(0.0, loss_ticks),
+            "loss_bps": max(0.0, loss_bps),
+            "depth_multiplier": depth_multiplier,
+            "cliff_detected": cliff_detected,
+        }
+
+    def evaluate_token_entry(
+        self,
+        token_id: str,
+        orderbook: Optional[Dict[str, Any]],
+        market: Optional[Dict[str, Any]] = None,
+        order_size: Optional[float] = None,
+        now_monotonic: Optional[float] = None,
+    ) -> EntryDecision:
+        """Full entry gate for one token (freshness, spread, safety, exit depth)."""
+        if not orderbook:
+            return EntryDecision(False, ENTRY_INVALID_BOOK, token_id, {"error": "missing orderbook"})
+
+        normalized = normalize_orderbook(orderbook, now_monotonic=now_monotonic)
+        details: dict = {
+            "best_bid": normalized.best_bid,
+            "best_ask": normalized.best_ask,
+            "age_seconds": normalized.age_seconds,
+        }
+
+        if normalized.is_empty:
+            return EntryDecision(False, ENTRY_EMPTY_BOOK, token_id, details)
+        if normalized.is_one_sided:
+            return EntryDecision(False, ENTRY_ONE_SIDED_BOOK, token_id, details)
+        if normalized.is_crossed:
+            return EntryDecision(False, ENTRY_CROSSED_BOOK, token_id, details)
+        if normalized.best_bid is None or normalized.best_ask is None:
+            return EntryDecision(False, ENTRY_INVALID_BOOK, token_id, details)
+        if normalized.age_seconds is None or normalized.age_seconds > config.max_orderbook_age_seconds:
+            return EntryDecision(False, ENTRY_STALE_BOOK, token_id, details)
+
+        spread = normalized.best_ask - normalized.best_bid
+        details["spread"] = spread
+        max_spread = config.spread_range.get("max")
+        if max_spread is not None and spread > max_spread:
+            return EntryDecision(False, ENTRY_SPREAD_TOO_WIDE, token_id, details)
+
+        if market is None:
+            market = {}
+        rewards_max_spread = market.get("rewards_max_spread", 0)
+        if not rewards_max_spread:
+            return EntryDecision(False, ENTRY_INVALID_BOOK, token_id, details)
+
+        prices = self.calculate_order_prices(orderbook, rewards_max_spread, market=market)
+        if not prices:
+            return EntryDecision(False, ENTRY_INVALID_BOOK, token_id, details)
+
+        actual_buy_price = self.calculate_actual_buy_price(orderbook, prices["buy_price"])
+        details["actual_buy_price"] = actual_buy_price
+        if actual_buy_price is None:
+            return EntryDecision(False, ENTRY_NO_SECOND_BID, token_id, details)
+
+        if order_size is None:
+            order_size = self.calculate_order_size(market)
+        details["order_size"] = order_size
+
+        can_place, safety_info = self.can_place_buy_order_safely(
+            orderbook,
+            prices["buy_price"],
+            prices["sell_price"],
+            order_size,
+            actual_buy_price,
+        )
+        if not can_place:
+            reason_text = safety_info.get("reason", "")
+            if "价格断层" in reason_text or "断层" in reason_text:
+                reason = ENTRY_PRICE_CLIFF
+            elif "保护份额" in reason_text:
+                reason = ENTRY_INSUFFICIENT_PROTECTION
+            else:
+                reason = ENTRY_NO_SECOND_BID
+            details["safety_reason"] = reason_text
+            return EntryDecision(False, reason, token_id, details)
+
+        # 退出能力模拟：按 bids 从高到低累计
+        simulation = self._simulate_exit(
+            normalized.normalized_bids,
+            order_size,
+            actual_buy_price,
+            config.min_exit_depth_multiplier,
+            config.price_cliff_threshold,
+        )
+        details["exit_simulation"] = simulation
+
+        if simulation["cumulative_size"] < simulation["needed"]:
+            return EntryDecision(False, ENTRY_INSUFFICIENT_EXIT_DEPTH, token_id, details)
+        if simulation["cliff_detected"]:
+            return EntryDecision(False, ENTRY_PRICE_CLIFF, token_id, details)
+        if simulation["loss_bps"] > config.exit_immediate_max_loss_bps:
+            return EntryDecision(False, ENTRY_EXIT_VWAP_TOO_LOSSY, token_id, details)
+        # 买盘顶层极小档位视为不稳定保护
+        if normalized.normalized_bids:
+            top_size = normalized.normalized_bids[0][1]
+            if top_size < float(order_size) * 0.1:
+                details["safety_reason"] = "买一价档位过小，保护不稳定"
+                return EntryDecision(False, ENTRY_INSUFFICIENT_PROTECTION, token_id, details)
+
+        details["accepted"] = True
+        return EntryDecision(True, ENTRY_ACCEPTED, token_id, details)
+
+    def evaluate_market_entry(
+        self,
+        market: Dict[str, Any],
+        orderbooks_dict: Dict[str, Dict[str, Any]],
+        order_size: Optional[float] = None,
+        now_monotonic: Optional[float] = None,
+    ) -> EntryDecision:
+        """Gate the whole market: every required token must pass.
+
+        A liquid token can never mask an illiquid one.
+        """
+        tokens = market.get("tokens", [])
+        details: dict = {"tokens": {}}
+        for token in tokens:
+            token_id = token.get("token_id")
+            if not token_id:
+                continue
+            decision = self.evaluate_token_entry(
+                token_id,
+                orderbooks_dict.get(token_id),
+                market=market,
+                order_size=order_size,
+                now_monotonic=now_monotonic,
+            )
+            details["tokens"][token_id] = {
+                "accepted": decision.accepted,
+                "reason": decision.reason,
+                "details": decision.details,
+            }
+            if not decision.accepted:
+                return EntryDecision(False, decision.reason, token_id, details)
+        return EntryDecision(True, ENTRY_ACCEPTED, None, details)
     
     def calculate_order_size(
         self,

@@ -1,6 +1,7 @@
 """
 市场数据管理模块
 """
+import time
 from typing import List, Dict, Any, Optional
 from api_client import PolymarketAPIClient
 from config import config
@@ -23,6 +24,7 @@ class MarketManager:
         self.api_client = api_client
         self.markets: List[Dict[str, Any]] = []
         self.selected_markets: List[Dict[str, Any]] = []
+        self._monotonic = time.monotonic
     
     def scan_rewards_markets(self) -> List[Dict[str, Any]]:
         """
@@ -352,7 +354,7 @@ class MarketManager:
             market_spread = None
             tokens = market.get("tokens", [])
             
-            # 对每个 token 计算价差，取平均值
+            # 对每个 token 计算价差，取最差值（任一 token 不合格即拒绝整个市场）
             spreads = []
             for token in tokens:
                 token_id = token.get("token_id")
@@ -370,7 +372,7 @@ class MarketManager:
                 
                 normalized = normalize_orderbook(orderbook)
 
-                if normalized.is_empty or normalized.is_one_sided:
+                if normalized.is_empty or normalized.is_one_sided or normalized.is_crossed:
                     continue
                 
                 best_bid = normalized.best_bid
@@ -381,9 +383,9 @@ class MarketManager:
                     spread = best_ask - best_bid
                     spreads.append(spread)
             
-            # 如果有计算出的价差，使用平均值；否则使用 API 返回的 spread
+            # 如果有计算出的价差，使用最差值；否则使用 API 返回的 spread
             if spreads:
-                market_spread = sum(spreads) / len(spreads)
+                market_spread = max(spreads)
             else:
                 # 回退到 API 数据
                 market_spread = float(market.get("spread", 0))
@@ -667,6 +669,16 @@ class MarketManager:
         
         if not tokens or not rewards_max_spread:
             return False, "市场缺少 tokens 或 rewards_max_spread", {}
+
+        # 完整市场准入（最差边点差 + 数据新鲜度 + 退出能力模拟）
+        entry = strategy.evaluate_market_entry(
+            market,
+            orderbooks_dict,
+            now_monotonic=self._monotonic(),
+        )
+        if not entry.accepted:
+            failure_reasons = {entry.reason: 1}
+            return False, f"市场准入拒绝: {entry.reason}", failure_reasons
         
         # 统计各种失败原因
         failure_reasons = {}  # {reason: count}
