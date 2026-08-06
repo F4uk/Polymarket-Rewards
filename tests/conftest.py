@@ -85,10 +85,12 @@ def make_order_manager(
     om.order_fingerprints = {}
     om.requote_confirmations = {}
     om.position_diff_confirmations = {}
+    om.inventory_generations = {}
     om.metrics = {}
-    om.lock = threading.Lock()
+    om.lock = threading.RLock()
     om._now = clock.time
     om._monotonic = clock.monotonic
+    om._init_metrics()
     return om
 
 

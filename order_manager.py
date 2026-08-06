@@ -110,11 +110,47 @@ class OrderManager:
         self.hedge_sell_failures: Dict[str, float] = {}
         # 订阅的 token 集合：用于管理小范围订阅（只订阅机会市场）
         # HTTP 方式不需要订阅，已移除 subscribed_tokens
-        self.lock = threading.Lock()  # 线程锁
+        self.lock = threading.RLock()  # 线程锁（可重入，供内部辅助方法嵌套使用）
+        self._now = time.time
+        self._monotonic = time.monotonic
+        # 分级库存退出状态：token_id -> state dict
+        self.inventory_exits: Dict[str, Dict[str, Any]] = {}
+        # 清仓后重新入场冷却：token_id -> ready_at（单调时钟）
+        self.reentry_cooldowns: Dict[str, float] = {}
+        # 订单业务指纹：fingerprint -> expiry（用于阻止确认窗口内的重复订单）
+        self.order_fingerprints: Dict[str, float] = {}
+        # 库存代数：token_id -> generation（用于订单指纹区分不同批次库存）
+        self.inventory_generations: Dict[str, int] = {}
+        self._init_metrics()
         
         # WebSocket 相关初始化已移除，现在使用 HTTP 接口获取订单簿
         
         logger.info("订单管理器初始化完成")
+
+    def _init_metrics(self) -> None:
+        """轻量内存指标（仅日志/统计使用，不引入监控系统）。"""
+        self.metrics: Dict[str, float] = {
+            "buys_placed": 0.0,
+            "buys_cancelled": 0.0,
+            "safety_cancels": 0.0,
+            "requotes": 0.0,
+            "retained_markets": 0.0,
+            "full_fills": 0.0,
+            "partial_fills": 0.0,
+            "fast_exit_count": 0.0,
+            "limited_wait_count": 0.0,
+            "emergency_exit_count": 0.0,
+            "avg_hold_time_seconds": 0.0,
+            "exit_price_loss": 0.0,
+            "blocked_reentry_count": 0.0,
+            "stale_book_rejections": 0.0,
+            "insufficient_exit_depth_rejections": 0.0,
+            "pending_confirmation_count": 0.0,
+            "unknown_order_count": 0.0,
+            "blocked_duplicate_count": 0.0,
+            "exit_fills": 0.0,
+            "positions_flat": 0.0,
+        }
     
     def _build_order_options(self, market_id: str, token_id: str) -> PartialCreateOrderOptions:
         """构建 CLOB V2 下单选项。"""
@@ -280,6 +316,436 @@ class OrderManager:
         """
         # HTTP 方式不需要订阅，直接返回
         pass
+
+    # ------------------------------------------------------------------
+    # 分级库存退出（FAST_EXIT / LIMITED_WAIT / EMERGENCY_EXIT / FLAT）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _order_fingerprint(
+        token_id: str,
+        side: str,
+        price: float,
+        size: float,
+        purpose: str,
+        generation: int = 0,
+    ) -> str:
+        return f"{token_id}:{side.upper()}:{price:.8f}:{size:.8f}:{purpose}:{generation}"
+
+    def _is_duplicate_order(
+        self,
+        token_id: str,
+        side: str,
+        price: float,
+        size: float,
+        purpose: str,
+        generation: int = 0,
+    ) -> bool:
+        fingerprint = self._order_fingerprint(
+            token_id, side, price, size, purpose, generation
+        )
+        with self.lock:
+            expiry = self.order_fingerprints.get(fingerprint)
+            if expiry is not None and expiry > self._monotonic():
+                self.metrics["blocked_duplicate_count"] += 1
+                return True
+            return False
+
+    def _record_order_fingerprint(
+        self,
+        token_id: str,
+        side: str,
+        price: float,
+        size: float,
+        purpose: str,
+        generation: int = 0,
+    ) -> None:
+        fingerprint = self._order_fingerprint(
+            token_id, side, price, size, purpose, generation
+        )
+        with self.lock:
+            self.order_fingerprints[fingerprint] = (
+                self._monotonic() + config.order_confirmation_timeout_seconds
+            )
+
+    def has_inventory_or_pending_exit(self, token_id: str) -> bool:
+        """Unified check blocking new BUY until inventory is flat and cooled down."""
+        with self.lock:
+            state = self.inventory_exits.get(token_id)
+            if state is not None and state.get("state") != "FLAT":
+                return True
+            if self.reentry_cooldowns.get(token_id, 0.0) > self._monotonic():
+                return True
+            for _market_id, tokens_dict in self.active_orders.items():
+                sides = tokens_dict.get(token_id)
+                if not sides:
+                    continue
+                sell_info = sides.get("SELL")
+                if sell_info:
+                    status = sell_info.get("status", "PENDING_CONFIRMATION")
+                    if status in (
+                        "PENDING_CONFIRMATION",
+                        "LIVE",
+                        "CANCEL_PENDING",
+                        "UNKNOWN",
+                        "SUBMITTED",
+                    ):
+                        return True
+            return False
+
+    def _new_inventory_state(
+        self,
+        market_id: str,
+        token_id: str,
+        entry_price: float,
+        filled_size: float,
+    ) -> Dict[str, Any]:
+        generation = self.inventory_generations.get(token_id, 0) + 1
+        self.inventory_generations[token_id] = generation
+        now = self._monotonic()
+        return {
+            "market_id": market_id,
+            "token_id": token_id,
+            "entry_price": float(entry_price),
+            "confirmed_filled_size": float(filled_size),
+            "remaining_size": float(filled_size),
+            "sold_size": 0.0,
+            "processed_fill_size": float(filled_size),
+            "processed_sell_size": 0.0,
+            "pending_sell_size": 0.0,
+            "first_fill_at": now,
+            "last_action_at": now,
+            "state": "FAST_EXIT",
+            "sell_order_id": None,
+            "sell_order_status": None,
+            "last_known_best_bid": None,
+            "flat_at": None,
+            "generation": generation,
+        }
+
+    def _handle_buy_fill(
+        self,
+        market_id: str,
+        token_id: str,
+        buy_price: float,
+        filled_size: float,
+    ) -> bool:
+        """Idempotently process a BUY fill delta and start tiered exit."""
+        filled_size = float(filled_size)
+        delta = 0.0
+        state = None
+        with self.lock:
+            state = self.inventory_exits.get(token_id)
+            if state is None:
+                state = self._new_inventory_state(market_id, token_id, buy_price, 0.0)
+                self.inventory_exits[token_id] = state
+            delta = filled_size - float(state.get("processed_fill_size", 0.0))
+            if delta <= 0:
+                return False
+            state["processed_fill_size"] = filled_size
+            state["confirmed_filled_size"] = float(state.get("confirmed_filled_size", 0.0)) + delta
+            state["remaining_size"] = state["confirmed_filled_size"] - float(state.get("sold_size", 0.0))
+            if not state.get("entry_price"):
+                state["entry_price"] = float(buy_price)
+            if not state.get("first_fill_at"):
+                state["first_fill_at"] = self._monotonic()
+            state["last_action_at"] = self._monotonic()
+            state["state"] = "FAST_EXIT"
+
+        if state["confirmed_filled_size"] <= config.position_dust_size:
+            self._mark_inventory_flat(token_id, reason="fill below dust")
+            return True
+        self._process_inventory_exit(token_id)
+        return True
+
+    def _mark_inventory_flat(self, token_id: str, reason: str = "") -> None:
+        with self.lock:
+            state = self.inventory_exits.get(token_id)
+            if state is None:
+                return
+            state["state"] = "FLAT"
+            state["flat_at"] = self._monotonic()
+            state["sell_order_id"] = None
+            state["sell_order_status"] = None
+            state["remaining_size"] = 0.0
+            state["pending_sell_size"] = 0.0
+            self.reentry_cooldowns[token_id] = (
+                self._monotonic() + config.post_fill_reentry_cooldown_seconds
+            )
+            self.metrics["positions_flat"] += 1
+        logger.info(f"库存已清: token={token_id[:20]}... 原因={reason or '全部卖出'}")
+
+    def _submit_inventory_sell(
+        self,
+        token_id: str,
+        price: float,
+        size: float,
+        purpose: str,
+    ) -> Optional[Dict[str, Any]]:
+        state = None
+        with self.lock:
+            state = self.inventory_exits.get(token_id)
+            if state is None or state.get("state") == "FLAT":
+                return None
+            if (
+                state.get("sell_order_id")
+                and state.get("sell_order_status") in ("PENDING_CONFIRMATION", "LIVE", "CANCEL_PENDING")
+            ):
+                return None
+            available = float(state.get("remaining_size", 0.0)) - float(state.get("pending_sell_size", 0.0))
+            size = min(float(size), available)
+            if size <= 0:
+                return None
+            generation = int(state.get("generation", 0))
+            state["pending_sell_size"] = float(state.get("pending_sell_size", 0.0)) + size
+            market_id = state["market_id"]
+
+        result = self.place_order(
+            market_id=market_id,
+            token_id=token_id,
+            side="SELL",
+            price=price,
+            size=size,
+            purpose=purpose,
+            generation=generation,
+        )
+        if result:
+            order_id = result.get("id") or result.get("orderID")
+            with self.lock:
+                current = self.inventory_exits.get(token_id)
+                if current is not None:
+                    current["sell_order_id"] = order_id
+                    current["sell_order_status"] = "PENDING_CONFIRMATION"
+                    current["last_action_at"] = self._monotonic()
+            if purpose == "FAST_EXIT":
+                self.metrics["fast_exit_count"] += 1
+            elif purpose == "LIMITED_WAIT_EXIT":
+                self.metrics["limited_wait_count"] += 1
+            elif purpose == "EMERGENCY_EXIT":
+                self.metrics["emergency_exit_count"] += 1
+        else:
+            with self.lock:
+                current = self.inventory_exits.get(token_id)
+                if current is not None:
+                    current["pending_sell_size"] = max(
+                        0.0,
+                        float(current.get("pending_sell_size", 0.0)) - size,
+                    )
+        return result
+
+    def _process_inventory_exit(self, token_id: str, force: bool = False) -> None:
+        state = None
+        with self.lock:
+            state = self.inventory_exits.get(token_id)
+            if state is None:
+                return
+            state = dict(state)
+
+        if state.get("state") == "FLAT":
+            return
+
+        market_id = state["market_id"]
+        entry_price = float(state["entry_price"])
+        orderbook = self._get_orderbook(token_id)
+        if not orderbook:
+            logger.warning(
+                f"库存退出：无法获取实时订单簿，token={token_id[:20]}... 暂不虚构成交"
+            )
+            return
+
+        normalized = normalize_orderbook(orderbook, now_monotonic=self._monotonic())
+        if (
+            normalized.age_seconds is None
+            or normalized.age_seconds > config.max_orderbook_age_seconds
+        ):
+            self.metrics["stale_book_rejections"] += 1
+            logger.warning(
+                f"库存退出：订单簿过期，token={token_id[:20]}... 暂不卖出"
+            )
+            return
+        if normalized.is_empty or normalized.is_one_sided or normalized.best_bid is None:
+            logger.warning(
+                f"库存退出：订单簿不可用（empty/one-sided），token={token_id[:20]}..."
+            )
+            return
+
+        best_bid = normalized.best_bid
+        tick_size = self.strategy.get_order_price_min_tick_size(
+            self.market_data_cache.get(market_id)
+        )
+        loss_per_unit = max(0.0, entry_price - best_bid)
+        loss_ticks = round(loss_per_unit / tick_size, 10)
+        loss_bps = (loss_per_unit / entry_price * 10000.0) if entry_price > 0 else 0.0
+        spread = (normalized.best_ask - best_bid) if normalized.best_ask is not None else 0.0
+
+        with self.lock:
+            current = self.inventory_exits.get(token_id)
+            if current is None:
+                return
+            previous_bid = current.get("last_known_best_bid")
+            current["last_known_best_bid"] = best_bid
+            if previous_bid is not None and best_bid < float(previous_bid) - 2.0 * tick_size:
+                current["_depth_dropped"] = True
+
+        emergency = force or loss_ticks >= config.exit_emergency_loss_ticks or (
+            loss_bps >= config.exit_emergency_loss_bps
+        )
+        now = self._monotonic()
+        hold_seconds = now - float(state.get("first_fill_at", now))
+        if hold_seconds >= config.exit_max_hold_seconds:
+            emergency = True
+        if spread > (config.spread_range.get("max") or float("inf")):
+            emergency = True
+        if normalized.is_crossed:
+            emergency = True
+        with self.lock:
+            current = self.inventory_exits.get(token_id)
+            if current and current.get("_depth_dropped"):
+                emergency = True
+                current.pop("_depth_dropped", None)
+
+        fast = (
+            loss_ticks <= config.exit_immediate_max_loss_ticks
+            and loss_bps <= config.exit_immediate_max_loss_bps
+        )
+
+        with self.lock:
+            current = self.inventory_exits.get(token_id)
+            if current is None:
+                return
+            current_state = current.get("state")
+
+        if emergency or current_state == "EMERGENCY_EXIT":
+            with self.lock:
+                current = self.inventory_exits.get(token_id)
+                if current is not None:
+                    current["state"] = "EMERGENCY_EXIT"
+                    current["last_action_at"] = now
+            sell_id = state.get("sell_order_id")
+            sell_status = state.get("sell_order_status")
+            if sell_id and sell_status in ("PENDING_CONFIRMATION", "LIVE", "CANCEL_PENDING"):
+                self.cancel_order(sell_id)
+                with self.lock:
+                    current = self.inventory_exits.get(token_id)
+                    if current is not None:
+                        current["sell_order_id"] = None
+                        current["sell_order_status"] = "CANCEL_PENDING"
+                        current["pending_sell_size"] = 0.0
+            exit_price = self.strategy.immediate_exit_price(best_bid, tick_size)
+            self._submit_inventory_sell(
+                token_id, exit_price, state["remaining_size"], "EMERGENCY_EXIT"
+            )
+            return
+
+        if fast:
+            with self.lock:
+                current = self.inventory_exits.get(token_id)
+                if current is not None:
+                    current["state"] = "FAST_EXIT"
+                    current["last_action_at"] = now
+            exit_price = self.strategy.immediate_exit_price(best_bid, tick_size)
+            self._submit_inventory_sell(
+                token_id, exit_price, state["remaining_size"], "FAST_EXIT"
+            )
+            return
+
+        # LIMITED_WAIT：被动卖出，等待时间有限
+        with self.lock:
+            current = self.inventory_exits.get(token_id)
+            if current is not None:
+                current["state"] = "LIMITED_WAIT"
+                current["last_action_at"] = now
+        if not state.get("sell_order_id") or state.get("sell_order_status") in ("CANCELLED", "FAILED"):
+            passive_price = self.strategy.round_price_to_tick(entry_price, tick_size, "SELL")
+            self._submit_inventory_sell(
+                token_id, passive_price, state["remaining_size"], "LIMITED_WAIT_EXIT"
+            )
+
+    def _confirm_inventory_sells(self, token_id: str) -> None:
+        """Confirm SELL fills via trades (primary) and positions (cross-check)."""
+        with self.lock:
+            state = self.inventory_exits.get(token_id)
+            if state is None or state.get("state") == "FLAT":
+                return
+            sell_order_id = state.get("sell_order_id")
+            sell_status = state.get("sell_order_status")
+            state_copy = dict(state)
+        if not sell_order_id:
+            return
+
+        open_order_ids: Set[str] = set()
+        try:
+            open_orders = self.clob_client.get_open_orders(OpenOrderParams())
+            open_order_ids = {o.get("id") for o in open_orders if o.get("id")}
+        except Exception:
+            open_order_ids = set()
+
+        total_sold = self._query_order_filled_size(sell_order_id)
+        with self.lock:
+            current = self.inventory_exits.get(token_id)
+            if current is None:
+                return
+            delta = max(0.0, float(total_sold) - float(current.get("processed_sell_size", 0.0)))
+            if delta > 0:
+                current["sold_size"] = float(current.get("sold_size", 0.0)) + delta
+                current["processed_sell_size"] = float(total_sold)
+                current["pending_sell_size"] = max(
+                    0.0,
+                    float(current.get("pending_sell_size", 0.0)) - delta,
+                )
+                current["remaining_size"] = max(
+                    0.0,
+                    float(current.get("confirmed_filled_size", 0.0))
+                    - float(current.get("sold_size", 0.0)),
+                )
+                self.metrics["exit_fills"] += delta
+                last_bid = float(current.get("last_known_best_bid") or 0.0)
+                self.metrics["exit_price_loss"] += (
+                    max(0.0, float(current.get("entry_price", 0.0)) - last_bid) * delta
+                )
+            if current["remaining_size"] <= config.position_dust_size:
+                current["state"] = "FLAT"
+                current["flat_at"] = self._monotonic()
+                current["sell_order_id"] = None
+                current["sell_order_status"] = None
+                self.reentry_cooldowns[token_id] = (
+                    self._monotonic() + config.post_fill_reentry_cooldown_seconds
+                )
+                self.metrics["positions_flat"] += 1
+                logger.info(f"SELL 成交确认，库存已清: token={token_id[:20]}...")
+                return
+            if (
+                current.get("sell_order_status") == "CANCEL_PENDING"
+                and sell_order_id not in open_order_ids
+            ):
+                current["sell_order_id"] = None
+                current["sell_order_status"] = "CANCELLED"
+                current["pending_sell_size"] = 0.0
+                logger.info(
+                    f"SELL 取消已确认: token={token_id[:20]}..., order_id={sell_order_id[:20]}..."
+                )
+                return
+            current["sell_order_status"] = "LIVE"
+
+    def check_inventory_exits(self) -> Dict[str, bool]:
+        """Process all tracked inventory: confirm sells and advance exit states."""
+        results: Dict[str, bool] = {}
+        for token_id in list(self.inventory_exits.keys()):
+            with self.lock:
+                state = self.inventory_exits.get(token_id)
+                if state is None:
+                    continue
+                if state.get("state") == "FLAT":
+                    results[token_id] = True
+                    continue
+            self._confirm_inventory_sells(token_id)
+            self._process_inventory_exit(token_id)
+            with self.lock:
+                state = self.inventory_exits.get(token_id)
+                if state is not None and state.get("state") == "FLAT":
+                    results[token_id] = True
+                else:
+                    results[token_id] = False
+        return results
     
     def place_order(
         self,
@@ -288,7 +754,9 @@ class OrderManager:
         side: str,
         price: float,
         size: float,
-        order_type: OrderType = OrderType.GTC
+        order_type: OrderType = OrderType.GTC,
+        purpose: str = "REWARD_BUY",
+        generation: int = 0,
     ) -> Optional[Dict[str, Any]]:
         """
         下单（在奖励区间边界挂单）
@@ -318,7 +786,20 @@ class OrderManager:
         # 方向性取整：BUY 向下、SELL 向上（避免浮点误差，使用 Decimal）
         market = self.market_data_cache.get(market_id)
         tick_size = self.strategy.get_order_price_min_tick_size(market)
-        price = self.strategy.round_price_to_tick(price, tick_size, side)
+        if purpose in ("FAST_EXIT", "EMERGENCY_EXIT"):
+            # 立即退出卖价已由 immediate_exit_price 向下对齐到 tick 且不高于 best bid；
+            # 此处禁止再次向上取整，否则会离开可成交价格。
+            price = round(float(price), 10)
+        else:
+            price = self.strategy.round_price_to_tick(price, tick_size, side)
+
+        # 业务指纹去重：确认窗口内禁止提交相同业务目的的重复订单
+        if self._is_duplicate_order(token_id, side, price, size, purpose, generation):
+            logger.warning(
+                f"重复订单被阻止: token={token_id[:20]}..., 方向={side}, "
+                f"价格={price:.4f}, 份额={size:.2f}, purpose={purpose}"
+            )
+            return None
         
         # 验证价格是否在有效范围内（双重检查）
         if price < 0.01 or price > 1.0:
@@ -374,16 +855,23 @@ class OrderManager:
                         if token_id not in self.active_orders[market_id]:
                             self.active_orders[market_id][token_id] = {}
                         
-                        self.active_orders[market_id][token_id][side.upper()] = {
-                            "order_id": order_id,
-                            "token_id": token_id,
-                            "side": side.upper(),
-                            "price": price,
-                            "size": size,
-                            "exposure": exposure,
-                            "created_at": time.time(),
-                            "response": response
-                        }
+                    self.active_orders[market_id][token_id][side.upper()] = {
+                        "order_id": order_id,
+                        "token_id": token_id,
+                        "side": side.upper(),
+                        "price": price,
+                        "size": size,
+                        "exposure": exposure,
+                        "created_at": self._now(),
+                        "submitted_at": self._now(),
+                        "status": "PENDING_CONFIRMATION",
+                        "purpose": purpose,
+                        "generation": generation,
+                        "response": response
+                    }
+                    self._record_order_fingerprint(
+                        token_id, side, price, size, purpose, generation
+                    )
                     
                     # 获取订单状态描述
                     order_status = response.get("status", "unknown")
@@ -1087,9 +1575,9 @@ class OrderManager:
                                 f"累计成交份额={new_total_filled:.2f}"
                             )
                             
-                            # 挂出对应对冲卖单（只对冲新增的部分）
+                            # 处理新增成交差额并进入分级库存退出
                             try:
-                                hedge_result = self.place_hedge_sell(
+                                hedge_result = self._handle_buy_fill(
                                     market_id=market_id,
                                     token_id=token_id,
                                     buy_price=price,
@@ -1688,9 +2176,9 @@ class OrderManager:
                 filled_size = filled_order_data["filled_size"]
                 is_partial = filled_order_data.get("is_partial", False)
                 
-                # 立即对冲卖出（使用实际成交份额）
+                # 进入分级库存退出（使用实际成交份额）
                 try:
-                    hedge_result = self.place_hedge_sell(
+                    hedge_result = self._handle_buy_fill(
                         market_id=market_id,
                         token_id=token_id,
                         buy_price=order_info.get("price"),
@@ -1770,9 +2258,9 @@ class OrderManager:
                                 self.filled_buy_orders[market_id] = []
                             self.filled_buy_orders[market_id].append(filled_order_info)
                         
-                        # 立即对冲卖出（使用已成交份额）
+                        # 进入分级库存退出（使用已成交份额）
                         try:
-                            hedge_result = self.place_hedge_sell(
+                            hedge_result = self._handle_buy_fill(
                                 market_id=market_id,
                                 token_id=token_id,
                                 buy_price=order_info.get("price"),
@@ -1785,84 +2273,6 @@ class OrderManager:
                         except Exception as e:
                             logger.error(f"部分成交买单对冲卖出时发生错误: {e}")
                     
-                    # 重新提交完整订单（满足最小份额要求）
-                    try:
-                        market = self.market_data_cache.get(market_id)
-                        if market:
-                            # 获取订单簿数据
-                            orderbook = self._get_orderbook(token_id)
-                            if orderbook:
-                                rewards_max_spread = market.get("rewards_max_spread", 0)
-                                if rewards_max_spread > 0:
-                                    # 计算新的订单价格和份额
-                                    prices = self.strategy.calculate_order_prices(orderbook, rewards_max_spread, market=market)
-                                    if prices:
-                                        order_size = self.strategy.calculate_order_size(market)
-                                        
-                                        # 重新提交订单
-                                        buy_price = prices.get("buy_price")
-                                        sell_price = prices.get("sell_price")
-                                        target_price = buy_price if side == "BUY" else prices.get("sell_price")
-                                        
-                                        if target_price:
-                                            # 如果是买单，检查是否可以安全挂单（风险管理）
-                                            if side == "BUY":
-                                                if buy_price and sell_price:
-                                                    # 计算实际挂单价格（买二价或奖励下边界）
-                                                    actual_buy_price = self.strategy.calculate_actual_buy_price(orderbook, buy_price)
-                                                    
-                                                    # 如果没有实际挂单价格（订单簿只有买一价），跳过
-                                                    if actual_buy_price is None:
-                                                        logger.warning(
-                                                            f"部分成交订单重新提交失败: 订单簿只有买一价，跳过重新提交"
-                                                        )
-                                                        continue
-                                                    
-                                                    can_place, safety_info = self.strategy.can_place_buy_order_safely(
-                                                        orderbook, buy_price, sell_price, order_size, actual_buy_price
-                                                    )
-                                                    
-                                                    if not can_place:
-                                                        logger.warning(
-                                                            f"部分成交订单重新提交失败（风险管理）: {safety_info['reason']}，"
-                                                            f"跳过重新提交以避免风险"
-                                                        )
-                                                        continue
-                                                    else:
-                                                        logger.info(f"部分成交订单重新提交检查通过: {safety_info['reason']}")
-                                                    
-                                                    # 使用实际挂单价格
-                                                    target_price = actual_buy_price
-                                            
-                                            # 买单不进行规范化，直接使用 target_price（原始买二价或奖励下边界）
-                                            # 卖单需要进行规范化
-                                            if side == "SELL":
-                                                target_price = self.strategy.normalize_price(
-                                                    target_price, 
-                                                    self.strategy.get_order_price_min_tick_size(market)
-                                                )
-                                            new_order = self.place_order(
-                                                market_id=market_id,
-                                                token_id=token_id,
-                                                side=side,
-                                                price=target_price,
-                                                size=order_size
-                                            )
-                                            if new_order:
-                                                logger.info(
-                                                    f"部分成交订单已重新提交: 市场={market_id}, "
-                                                    f"token={token_id[:20]}..., 新订单份额={order_size}"
-                                                )
-                                    else:
-                                        logger.warning(f"无法计算订单价格，跳过重新提交: 市场={market_id}, token={token_id[:20]}...")
-                                else:
-                                    logger.warning(f"市场无奖励配置，跳过重新提交: 市场={market_id}")
-                            else:
-                                logger.warning(f"无法获取订单簿，跳过重新提交: 市场={market_id}, token={token_id[:20]}...")
-                        else:
-                            logger.warning(f"无法获取市场数据，跳过重新提交: 市场={market_id}")
-                    except Exception as e:
-                        logger.error(f"重新提交部分成交订单时发生错误: {e}")
                 else:
                     logger.error(f"取消部分成交订单失败: 订单ID={order_id}")
             
@@ -2413,30 +2823,30 @@ class OrderManager:
     
     def check_positions_and_hedge(self) -> Dict[str, bool]:
         """
-        检查持仓并挂出对冲卖单
+        检查持仓并把已有持仓纳入分级库存退出管理。
         
-        简化逻辑：直接根据持仓数据挂出卖单，不需要复杂的订单成交检测
-        如果持仓份额与已挂卖单份额不一致，取消旧的卖出订单并重新挂出全仓卖出订单
+        持仓 API 暂时返回空时不会放弃由成交记录确认的库存；退出流程由
+        check_inventory_exits() 驱动。
         
         Returns:
-            字典 {token_id: success}，记录每个token的对冲卖出结果
+            字典 {token_id: success}，记录每个 token 的库存退出处理结果
         """
+        return self._reconcile_positions_to_inventory()
+
+    def _reconcile_positions_to_inventory(self) -> Dict[str, bool]:
+        """把已有持仓对账到分级库存状态，然后推进退出流程。"""
         results = {}
         
         try:
             # 1. 获取所有持仓
             positions = self.get_positions(size_threshold=0.1, limit=1000)
             if not positions:
-                logger.debug("没有持仓，跳过对冲卖出检查")
-                return results
+                logger.debug("没有持仓，跳过对账（已有库存状态保留）")
+                return self.check_inventory_exits()
             
-            logger.info(f"开始检查持仓对冲: 共 {len(positions)} 个持仓")
+            logger.info(f"开始持仓对账: 共 {len(positions)} 个持仓")
             
-            # 2. 获取当前活跃订单（用于检查是否已有对冲卖单）
-            open_orders = self.clob_client.get_open_orders(OpenOrderParams())
-            open_order_ids = {order.get("id") for order in open_orders if order.get("id")}
-            
-            # 3. 对于每个持仓，检查是否需要挂出对冲卖单
+            # 2. 对每个持仓建立/更新库存状态
             for position in positions:
                 token_id = position.get("asset")
                 position_size = float(position.get("size", 0))
@@ -2445,209 +2855,53 @@ class OrderManager:
                 if not token_id or position_size <= 0:
                     continue
                 
-                # 通过 token_id 获取 market_id（持仓数据中没有 market_id，只有 conditionId）
                 market_id = self._get_market_id_from_token_id(token_id)
                 
-                # 如果无法获取 market_id，跳过并记录警告
                 if not market_id:
                     logger.warning(
-                        f"无法通过 token_id 获取 market_id，跳过对冲卖出: "
+                        f"无法通过 token_id 获取 market_id，跳过对账: "
                         f"token={token_id[:20]}..., 持仓份额={position_size:.2f}, "
                         f"conditionId={position.get('conditionId', 'N/A')[:30]}..."
                     )
                     continue
-                
-                # 检查是否已有对冲卖单
-                existing_sell_order_id = None
-                existing_sell_size = 0.0
-                exposure_to_remove = 0.0  # 需要移除的敞口（在锁外处理）
-                
+
                 with self.lock:
-                    if market_id in self.active_orders:
-                        if token_id in self.active_orders[market_id]:
-                            sell_order_info = self.active_orders[market_id][token_id].get("SELL")
-                            if sell_order_info:
-                                existing_sell_order_id = sell_order_info.get("order_id")
-                                # 检查订单是否仍在活跃列表中
-                                if existing_sell_order_id and existing_sell_order_id in open_order_ids:
-                                    existing_sell_size = float(sell_order_info.get("size", 0))
-                                else:
-                                    # 订单不在活跃列表中，说明已取消或成交，清理 active_orders
-                                    if existing_sell_order_id:
-                                        logger.debug(
-                                            f"发现已取消/成交的卖单，清理 active_orders: "
-                                            f"token={token_id[:20]}..., order_id={existing_sell_order_id[:20]}..."
-                                        )
-                                    # 记录需要移除的敞口（在锁外处理，避免死锁）
-                                    exposure_to_remove = sell_order_info.get("exposure", 0)
-                                    # 删除SELL订单记录
-                                    if "SELL" in self.active_orders[market_id][token_id]:
-                                        del self.active_orders[market_id][token_id]["SELL"]
-                                    # 清理空结构
-                                    if not self.active_orders[market_id][token_id]:
-                                        del self.active_orders[market_id][token_id]
-                                    if market_id in self.active_orders and not self.active_orders[market_id]:
-                                        del self.active_orders[market_id]
-                
-                # 在锁外移除敞口（避免死锁）
-                if exposure_to_remove > 0:
-                    self.risk_manager.remove_exposure(market_id, exposure_to_remove)
-                
-                # 持仓变化处理：如果持仓份额 != 已挂卖单份额，取消旧的并重新挂单
-                if abs(position_size - existing_sell_size) > 0.01:  # 允许0.01的浮点数误差
-                    # 检查是否在冷却期内（避免频繁重试失败的挂单）
-                    current_time = time.time()
-                    cooldown_period = 30.0  # 冷却期30秒
-                    with self.lock:
-                        last_failure_time = self.hedge_sell_failures.get(token_id, 0)
-                        if current_time - last_failure_time < cooldown_period:
-                            remaining_cooldown = cooldown_period - (current_time - last_failure_time)
-                            logger.debug(
-                                f"持仓对冲卖出跳过（冷却期）: token={token_id[:20]}..., "
-                                f"上次失败时间={time.strftime('%H:%M:%S', time.localtime(last_failure_time))}, "
-                                f"剩余冷却时间={remaining_cooldown:.1f}秒"
-                            )
-                            results[token_id] = False
+                    state = self.inventory_exits.get(token_id)
+                    if state is None:
+                        if position_size <= config.position_dust_size:
                             continue
-                    
-                    # 如果已有卖单且份额不一致，先取消旧订单
-                    if existing_sell_order_id and existing_sell_order_id in open_order_ids:
-                        logger.info(
-                            f"持仓变化，取消旧的卖出订单: token={token_id[:20]}..., "
-                            f"持仓份额={position_size:.2f}, 已挂卖单份额={existing_sell_size:.2f}, "
-                            f"订单ID={existing_sell_order_id[:20]}..."
+                        self.inventory_exits[token_id] = self._new_inventory_state(
+                            market_id, token_id, avg_price or 0.50, position_size
                         )
-                        if self.cancel_order(existing_sell_order_id):
-                            logger.info(f"成功取消旧的卖出订单: token={token_id[:20]}...")
-                        else:
-                            logger.warning(f"取消旧的卖出订单失败: token={token_id[:20]}...")
-                    
-                    # 计算对冲卖出价格（使用持仓的avgPrice作为买入价）
-                    market = self.market_data_cache.get(market_id)
-                    
-                    # 获取订单簿以计算买一价
-                    best_bid_price = None
-                    orderbook = self._get_orderbook(token_id)
-                    if orderbook:
-                        best_bid_price = normalize_orderbook(orderbook).best_bid
-                    
-                    max_bid_gap = config.hedge_sell_max_bid_gap
-                    
-                    # 计算对冲卖出价格（在允许范围内优先使用买一价）
-                    sell_price = self.strategy.calculate_hedge_sell_price(
-                        avg_price,
-                        market=market,
-                        best_bid_price=best_bid_price,
-                        max_bid_gap=max_bid_gap
-                    )
-                    
-                    # 记录价格策略信息
-                    if best_bid_price is not None and abs(avg_price - best_bid_price) <= max_bid_gap:
                         logger.info(
-                            f"持仓对冲卖出价格策略: 使用买一价 {best_bid_price:.4f} (与买入价差 {abs(avg_price - best_bid_price):.4f} ≤ 阈值 {max_bid_gap:.4f})"
-                        )
-                    elif best_bid_price is not None:
-                        logger.info(
-                            f"持仓对冲卖出价格策略: 买一价 {best_bid_price:.4f} 与买入价差 {abs(avg_price - best_bid_price):.4f} 超过阈值 {max_bid_gap:.4f}，回退到原价逻辑"
+                            f"启动对账：已有持仓纳入库存退出 token={token_id[:20]}... "
+                            f"份额={position_size:.2f}"
                         )
                     else:
-                        logger.info("持仓对冲卖出价格策略: 无法获取买一价，使用原价逻辑计算卖出价格")
-                    
-                    # 挂出全仓卖出订单
-                    sell_result = self.place_order(
-                        market_id=market_id,
-                        token_id=token_id,
-                        side="SELL",
-                        price=sell_price,
-                        size=position_size  # 使用全部持仓份额
-                    )
-                    
-                    if sell_result:
-                        # 订单提交成功，清除失败记录
-                        with self.lock:
-                            if token_id in self.hedge_sell_failures:
-                                del self.hedge_sell_failures[token_id]
-                        
-                        # 订单提交成功
-                        order_id = sell_result.get("id") or sell_result.get("orderID")
-                        order_status = sell_result.get("status", "unknown")
-                        
-                        logger.info(
-                            f"持仓对冲卖出成功: token={token_id[:20]}..., "
-                            f"持仓份额={position_size:.2f}, 买入价={avg_price:.4f}, 卖出价={sell_price:.4f}, "
-                            f"订单ID={order_id[:20] if order_id else 'N/A'}..., 状态={order_status}"
-                        )
-                        results[token_id] = True
-                    else:
-                        # place_order 返回 None，可能是验证失败
-                        # 但对于卖单，可能是立即成交了（matched），所以不在活跃列表中
-                        # 只检查一次持仓变化（避免长时间阻塞主线程）
-                        logger.warning(
-                            f"持仓对冲卖出订单提交后验证失败: token={token_id[:20]}..., "
-                            f"持仓份额={position_size:.2f}, 卖出价={sell_price:.4f}。"
-                            f"可能是订单被立即成交（matched），将检查持仓变化（最多等待2秒）..."
-                        )
-                        
-                        # 只检查一次，等待2秒（避免长时间阻塞）
-                        try:
-                            time.sleep(2.0)
-                            updated_positions = self.get_positions(size_threshold=0.1, limit=1000)
-                            updated_position_size = 0.0
-                            for pos in updated_positions:
-                                if pos.get("asset") == token_id:
-                                    updated_position_size = float(pos.get("size", 0))
-                                    break
-                            
-                            if updated_position_size < position_size:
-                                # 持仓减少了，说明订单可能被成交了，清除失败记录
-                                with self.lock:
-                                    if token_id in self.hedge_sell_failures:
-                                        del self.hedge_sell_failures[token_id]
-                                
-                                logger.info(
-                                    f"持仓对冲卖出已确认成交: token={token_id[:20]}..., "
-                                    f"原持仓={position_size:.2f}, 当前持仓={updated_position_size:.2f}, "
-                                    f"减少={position_size - updated_position_size:.2f}"
-                                )
-                                results[token_id] = True
-                            else:
-                                # 持仓未减少，记录失败时间（进入冷却期），避免频繁重试
-                                with self.lock:
-                                    self.hedge_sell_failures[token_id] = time.time()
-                                
-                                logger.warning(
-                                    f"持仓对冲卖出失败（进入冷却期）: token={token_id[:20]}..., "
-                                    f"持仓份额={position_size:.2f}, 当前持仓={updated_position_size:.2f}。"
-                                    f"持仓未变化，订单可能失败。将在30秒后再次尝试"
-                                )
-                                results[token_id] = False
-                        except Exception as e:
-                            # 检查出错，记录失败时间（进入冷却期）
-                            with self.lock:
-                                self.hedge_sell_failures[token_id] = time.time()
-                            
-                            logger.warning(
-                                f"检查持仓变化时出错: {e}，无法确认订单是否成交。"
-                                f"记录失败时间（进入冷却期），将在30秒后再次尝试: token={token_id[:20]}..."
+                        confirmed = float(state.get("confirmed_filled_size", 0.0))
+                        if position_size > confirmed + config.position_dust_size:
+                            state["confirmed_filled_size"] = position_size
+                            state["remaining_size"] = max(
+                                0.0,
+                                position_size - float(state.get("sold_size", 0.0)),
                             )
-                            results[token_id] = False
-                elif existing_sell_size > 0:
-                    # 持仓份额与已挂卖单份额一致，无需操作
-                    logger.debug(
-                        f"持仓与卖单份额一致，无需操作: token={token_id[:20]}..., "
-                        f"持仓份额={position_size:.2f}, 已挂卖单份额={existing_sell_size:.2f}"
-                    )
-                    results[token_id] = True
-                    
+                            logger.info(
+                                f"对账：持仓增长 token={token_id[:20]}... "
+                                f"{confirmed:.2f} -> {position_size:.2f}"
+                            )
+
+            # 3. 推进库存退出流程（SELL 确认 + 状态迁移）
+            return self.check_inventory_exits()
+
         except Exception as e:
             # 使用 try-except 包裹日志记录，防止日志写入失败导致程序卡死
             try:
                 error_msg = str(e)
                 # 检查是否是 API 认证错误
                 if "401" in error_msg or "Unauthorized" in error_msg or "Invalid api key" in error_msg:
-                    logger.error(f"检查持仓对冲时发生 API 认证错误: {e}，请检查 API 密钥是否有效")
+                    logger.error(f"持仓对账时发生 API 认证错误: {e}，请检查 API 密钥是否有效")
                 else:
-                    logger.error(f"检查持仓对冲时发生错误: {e}")
+                    logger.error(f"持仓对账时发生错误: {e}")
                 import traceback
                 traceback.print_exc()
             except Exception as log_error:
@@ -2996,6 +3250,12 @@ class OrderManager:
                         if order_info_to_remove:
                             break
                     if order_info_to_remove:
+                        break
+
+                # 同步库存退出状态：SELL 取消请求成功后进入 CANCEL_PENDING
+                for _token_id, state in self.inventory_exits.items():
+                    if state.get("sell_order_id") == order_id:
+                        state["sell_order_status"] = "CANCEL_PENDING"
                         break
             
             # 第二阶段：释放锁后，移除敞口（避免死锁）
