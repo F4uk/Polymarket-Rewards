@@ -10,7 +10,7 @@
 
 ## 快速开始
 
-**无需安装 Python**，下载 **[Releases](https://github.com/crazygirl437/Polymarket-Rewards/releases/tag/V1.0)** 对应平台的压缩包，解压后即可运行。
+**无需安装 Python**，下载 **[Releases](../../releases/latest)** 对应平台的压缩包，解压后即可运行。
 
 | 平台 | 下载包 | 内含文件 |
 |------|--------|----------|
