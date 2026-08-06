@@ -477,6 +477,15 @@ class OrderManager:
             self.reentry_cooldowns[token_id] = (
                 self._monotonic() + config.post_fill_reentry_cooldown_seconds
             )
+            hold_seconds = max(
+                0.0,
+                self._monotonic() - float(state.get("first_fill_at") or self._monotonic()),
+            )
+            flat_count = self.metrics["positions_flat"]
+            previous_avg = self.metrics["avg_hold_time_seconds"]
+            self.metrics["avg_hold_time_seconds"] = (
+                (previous_avg * flat_count + hold_seconds) / (flat_count + 1)
+            )
             self.metrics["positions_flat"] += 1
         logger.info(f"库存已清: token={token_id[:20]}... 原因={reason or '全部卖出'}")
 
@@ -721,6 +730,16 @@ class OrderManager:
                 self.reentry_cooldowns[token_id] = (
                     self._monotonic() + config.post_fill_reentry_cooldown_seconds
                 )
+                hold_seconds = max(
+                    0.0,
+                    self._monotonic()
+                    - float(current.get("first_fill_at") or self._monotonic()),
+                )
+                flat_count = self.metrics["positions_flat"]
+                previous_avg = self.metrics["avg_hold_time_seconds"]
+                self.metrics["avg_hold_time_seconds"] = (
+                    (previous_avg * flat_count + hold_seconds) / (flat_count + 1)
+                )
                 self.metrics["positions_flat"] += 1
                 logger.info(f"SELL 成交确认，库存已清: token={token_id[:20]}...")
                 return
@@ -834,6 +853,11 @@ class OrderManager:
                         else "PARTIALLY_FILLED"
                     )
                     if side == "BUY":
+                        if filled_size >= float(info.get("size", 0) or filled_size):
+                            self.metrics["full_fills"] += 1
+                        else:
+                            self.metrics["partial_fills"] += 1
+                    if side == "BUY":
                         self._handle_buy_fill(
                             market_id, token_id, info.get("price"), filled_size
                         )
@@ -914,6 +938,11 @@ class OrderManager:
                         if filled_size >= float(info.get("size", 0) or filled_size)
                         else "PARTIALLY_FILLED"
                     )
+                    if side == "BUY":
+                        if filled_size >= float(info.get("size", 0) or filled_size):
+                            self.metrics["full_fills"] += 1
+                        else:
+                            self.metrics["partial_fills"] += 1
                     if side == "BUY":
                         self._handle_buy_fill(
                             market_id, token_id, info.get("price"), filled_size
@@ -1100,6 +1129,8 @@ class OrderManager:
                     self._record_order_fingerprint(
                         token_id, side, price, size, purpose, generation
                     )
+                    if side == "BUY":
+                        self.metrics["buys_placed"] += 1
                     
                     # 获取订单状态描述
                     order_status = response.get("status", "unknown")
@@ -1556,9 +1587,9 @@ class OrderManager:
             
             # 只挂买单（使用实际挂单价格：买二价或奖励下边界）
             # 注意：不挂卖单，因为无持仓无法挂卖单
-            # 卖单将在买单成交后，通过 place_hedge_sell() 自动挂出
+            # 卖单将在买单成交后，通过分级库存退出流程自动挂出
             if actual_buy_price:
-                # 买单不进行规范化，直接使用 actual_buy_price（原始买二价或奖励下边界）
+                # 买单使用 actual_buy_price（已按 BUY 方向取整）
                 # 因为原始买二价一定是能下单的价格，奖励下边界是两位小数也一定能下单
                 buy_result = self.place_order(
                     market_id=market_id,
@@ -1769,6 +1800,7 @@ class OrderManager:
                             # 计算新增成交份额
                             new_filled_size = actual_filled_size - filled_size
                             new_total_filled = actual_filled_size
+                            self.metrics["partial_fills"] += 1
                             
                             logger.info(
                                 f"检测到部分成交订单继续成交: 订单ID={order_id[:20]}..., "
@@ -2393,6 +2425,10 @@ class OrderManager:
                 order_info = filled_order_data["order_info"]
                 filled_size = filled_order_data["filled_size"]
                 is_partial = filled_order_data.get("is_partial", False)
+                if is_partial:
+                    self.metrics["partial_fills"] += 1
+                else:
+                    self.metrics["full_fills"] += 1
                 
                 # 进入分级库存退出（使用实际成交份额）
                 try:
@@ -2436,6 +2472,7 @@ class OrderManager:
 
                 # 先处理新增成交差额（幂等；即使取消失败也不能漏掉新成交）
                 if side == "BUY" and filled > 0:
+                    self.metrics["partial_fills"] += 1
                     with self.lock:
                         filled_order_info = {
                             "market_id": market_id,
@@ -2512,339 +2549,7 @@ class OrderManager:
                     pass  # 如果连 stderr 都无法写入，静默忽略
         
         return filled_orders_by_market
-    
-        """
-        检查订单状态，检测成交并清理已取消/成交的订单记录
-        
-        简化版本：主要功能是清理订单记录和更新风险敞口
-        对冲卖出逻辑已由 check_positions_and_hedge() 处理，不再在此处处理
-        
-        Returns:
-            字典 {market_id: [filled_orders]}，包含已成交的订单信息（用于补单逻辑）
-        """
-        filled_orders_by_market = {}
-        cancelled_count = 0
-        
-        try:
-            # 获取所有活跃订单
-            open_orders = self.clob_client.get_open_orders(OpenOrderParams())
-            open_order_ids = {order.get("id") for order in open_orders if order.get("id")}
-            
-            # 收集所有不在活跃列表中的订单ID
-            missing_order_ids = []
-            missing_order_info = {}  # order_id -> order_info
-            
-            with self.lock:
-                for market_id, tokens_dict in list(self.active_orders.items()):
-                    for token_id, sides_dict in list(tokens_dict.items()):
-                        for side, order_info in list(sides_dict.items()):
-                            order_id = order_info.get("order_id")
-                            if order_id and order_id not in open_order_ids:
-                                missing_order_ids.append(order_id)
-                                missing_order_info[order_id] = {
-                                    "market_id": market_id,
-                                    "token_id": token_id,
-                                    "side": side,
-                                    "order_info": order_info
-                                }
-            
-            # 检测不在活跃列表中的订单是否成交
-            filled_order_ids = set()
-            filled_order_sizes = {}  # order_id -> filled_size
-            
-            if missing_order_ids:
-                # 使用交易历史查询检测订单成交
-                try:
-                    logger.info(f"查询交易历史以检测 {len(missing_order_ids)} 个不在活跃列表中的订单是否成交...")
-                    
-                    for order_id in missing_order_ids:
-                        order_info = missing_order_info.get(order_id)
-                        if not order_info:
-                            continue
-                        
-                        side = order_info.get("side")
-                        # 只处理买单（卖单成交由 check_positions_and_hedge() 处理）
-                        if side != "BUY":
-                            continue
-                        
-                        # 查询该订单的实际成交份额
-                        actual_filled_size = self._query_order_filled_size(order_id)
-                        
-                        if actual_filled_size > 0:
-                            filled_order_ids.add(order_id)
-                            filled_order_sizes[order_id] = actual_filled_size
-                            
-                            original_size = order_info.get("order_info", {}).get("size", 0)
-                            if actual_filled_size >= original_size:
-                                logger.info(
-                                    f"检测到订单完全成交: 订单ID={order_id[:20]}..., "
-                                    f"订单份额={original_size:.2f}, 实际成交份额={actual_filled_size:.2f}"
-                                )
-                            else:
-                                logger.info(
-                                    f"检测到订单部分成交: 订单ID={order_id[:20]}..., "
-                                    f"订单份额={original_size:.2f}, 实际成交份额={actual_filled_size:.2f}"
-                                )
-                    
-                    logger.info(f"交易历史查询: 找到 {len(filled_order_ids)} 个已成交订单")
-                except Exception as e:
-                    logger.warning(f"查询交易历史失败: {e}")
-            
-            # 收集需要处理的订单信息和风险敞口更新
-            risk_updates = []  # 风险敞口更新列表（在锁外执行，避免死锁）
-            
-            with self.lock:
-                for market_id, tokens_dict in list(self.active_orders.items()):
-                    filled_orders = []
-                    
-                    for token_id, sides_dict in list(tokens_dict.items()):
-                        for side, order_info in list(sides_dict.items()):
-                            order_id = order_info.get("order_id")
-                            original_size = order_info.get("size", 0)
-                            
-                            # 检查订单是否仍在活跃列表中
-                            if order_id in open_order_ids:
-                                # 订单仍在活跃列表中，检查是否完全成交
-                                try:
-                                    # 从活跃订单列表中查找该订单的详细信息
-                                    for open_order in open_orders:
-                                        if open_order.get("id") == order_id:
-                                            # 获取订单的已成交份额和剩余份额
-                                            filled = float(open_order.get("filled", 0))
-                                            remaining = float(open_order.get("remaining", 0))
-                                            current_size = float(open_order.get("size", original_size))
-                                            
-                                            # 检查是否完全成交（即使仍在活跃列表中，也可能是API延迟）
-                                            is_fully_filled = (
-                                                (filled > 0 and remaining == 0) or 
-                                                filled >= original_size or 
-                                                (filled > 0 and filled >= current_size)
-                                            )
-                                            
-                                            if is_fully_filled:
-                                                # 完全成交：验证交易历史确认成交份额
-                                                actual_filled_size = self._query_order_filled_size(order_id)
-                                                if actual_filled_size > 0:
-                                                    verified_filled_size = actual_filled_size
-                                                else:
-                                                    verified_filled_size = max(filled, original_size)
-                                                
-                                                logger.info(
-                                                    f"检测到完全成交订单（仍在活跃列表中）: 订单ID={order_id[:20]}..., "
-                                                    f"市场={market_id}, token={token_id[:20]}..., "
-                                                    f"原始份额={original_size:.2f}, 验证成交份额={verified_filled_size:.2f}"
-                                                )
-                                                
-                                                # 确保成交份额不超过原始份额
-                                                final_filled_size = min(verified_filled_size, original_size)
-                                                
-                                                # 从活跃订单中移除
-                                                del self.active_orders[market_id][token_id][side]
-                                                
-                                                # 如果是买单完全成交，记录到 filled_buy_orders（用于风险敞口管理）
-                                                if side == "BUY":
-                                                    order_info["filled_size"] = final_filled_size
-                                                    if market_id not in self.filled_buy_orders:
-                                                        self.filled_buy_orders[market_id] = []
-                                                    self.filled_buy_orders[market_id].append(order_info)
-                                                
-                                                # 收集需要更新风险敞口的信息（在锁外执行，避免死锁）
-                                                if side == "BUY":
-                                                    risk_updates.append({
-                                                        "type": "buy_filled",
-                                                        "market_id": market_id,
-                                                        "remove_exposure": order_info.get("exposure", 0),
-                                                        "add_filled_exposure": {
-                                                            "price": order_info.get("price", 0),
-                                                            "size": final_filled_size
-                                                        }
-                                                    })
-                                                else:
-                                                    risk_updates.append({
-                                                        "type": "sell_filled",
-                                                        "market_id": market_id,
-                                                        "token_id": token_id,
-                                                        "remove_exposure": order_info.get("exposure", 0),
-                                                        "filled_size": final_filled_size
-                                                    })
-                                                
-                                                # 添加到 filled_orders 列表（用于返回结果，供补单逻辑使用）
-                                                filled_order = {
-                                                    "market_id": market_id,
-                                                    "token_id": token_id,
-                                                    "side": side,
-                                                    "order_id": order_id,
-                                                    "price": order_info.get("price"),
-                                                    "size": order_info.get("size"),
-                                                    "filled_size": final_filled_size,
-                                                    "exposure": order_info.get("exposure"),
-                                                    "status": "filled"
-                                                }
-                                                filled_orders.append(filled_order)
-                                            break
-                                except Exception as e:
-                                    logger.error(f"检查订单成交状态时发生错误: {e}")
-                            
-                            elif order_id not in open_order_ids:
-                                # 订单不在活跃列表中，检查是否是成交
-                                if order_id in filled_order_ids:
-                                    # 订单已成交
-                                    filled_size = filled_order_sizes.get(order_id)
-                                    if not filled_size:
-                                        filled_size = self._query_order_filled_size(order_id)
-                                        if filled_size <= 0:
-                                            filled_size = order_info.get("size", 0)
-                                    
-                                    filled_size = float(filled_size)
-                                    original_size = float(order_info.get("size", 0))
-                                    
-                                    # 判断是完全成交还是部分成交
-                                    is_fully_filled = filled_size >= original_size
-                                    final_filled_size = original_size if is_fully_filled else filled_size
-                                    
-                                    if is_fully_filled:
-                                        logger.info(
-                                            f"检测到订单完全成交: 订单ID={order_id[:20]}..., "
-                                            f"市场={market_id}, token={token_id[:20]}..., "
-                                            f"原始份额={original_size:.2f}, 成交份额={final_filled_size:.2f}"
-                                        )
-                                    else:
-                                        logger.info(
-                                            f"检测到订单部分成交: 订单ID={order_id[:20]}..., "
-                                            f"市场={market_id}, token={token_id[:20]}..., "
-                                            f"原始份额={original_size:.2f}, 成交份额={final_filled_size:.2f}"
-                                        )
-                                    
-                                    # 从活跃订单中移除
-                                    del self.active_orders[market_id][token_id][side]
-                                    
-                                    # 如果是买单成交，记录到 filled_buy_orders（用于风险敞口管理）
-                                    if side == "BUY":
-                                        order_info["filled_size"] = final_filled_size
-                                        if market_id not in self.filled_buy_orders:
-                                            self.filled_buy_orders[market_id] = []
-                                        self.filled_buy_orders[market_id].append(order_info)
-                                    
-                                    # 收集需要更新风险敞口的信息（在锁外执行，避免死锁）
-                                    if side == "BUY":
-                                        risk_updates.append({
-                                            "type": "buy_filled" if is_fully_filled else "buy_partial_filled",
-                                            "market_id": market_id,
-                                            "remove_exposure": order_info.get("exposure", 0),
-                                            "add_filled_exposure": {
-                                                "price": order_info.get("price", 0),
-                                                "size": final_filled_size
-                                            }
-                                        })
-                                    else:
-                                        risk_updates.append({
-                                            "type": "sell_filled",
-                                            "market_id": market_id,
-                                            "token_id": token_id,
-                                            "remove_exposure": order_info.get("exposure", 0),
-                                            "filled_size": final_filled_size
-                                        })
-                                    
-                                    # 添加到 filled_orders 列表（用于返回结果，供补单逻辑使用）
-                                    filled_order = {
-                                        "market_id": market_id,
-                                        "token_id": token_id,
-                                        "side": side,
-                                        "order_id": order_id,
-                                        "price": order_info.get("price"),
-                                        "size": order_info.get("size"),
-                                        "filled_size": final_filled_size,
-                                        "exposure": order_info.get("exposure"),
-                                        "status": "filled" if is_fully_filled else "partially_filled"
-                                    }
-                                    filled_orders.append(filled_order)
-                                else:
-                                    # 订单已取消（不在活跃列表且不在交易历史中）
-                                    cancelled_count += 1
-                                    logger.info(f"订单已取消: 订单ID={order_id[:20]}..., 市场={market_id}")
-                                    
-                                    # 从活跃订单中移除
-                                    del self.active_orders[market_id][token_id][side]
-                                    
-                                    # 收集需要移除敞口的信息（在锁外执行，避免死锁）
-                                    risk_updates.append({
-                                        "type": "cancelled",
-                                        "market_id": market_id,
-                                        "remove_exposure": order_info.get("exposure", 0)
-                                    })
-                    
-                    # 清理空的市场和 token
-                    if market_id in self.active_orders:
-                        self.active_orders[market_id] = {
-                            token_id: sides_dict
-                            for token_id, sides_dict in self.active_orders[market_id].items()
-                            if sides_dict
-                        }
-                        if not self.active_orders[market_id]:
-                            del self.active_orders[market_id]
-                    
-                    if filled_orders:
-                        filled_orders_by_market[market_id] = filled_orders
-            
-            # 第二阶段：释放锁后，更新风险敞口（避免死锁）
-            # 处理在锁内收集的风险敞口更新
-            for update in risk_updates:
-                try:
-                    if update["type"] == "buy_filled" or update["type"] == "buy_partial_filled":
-                        # 买单成交（完全或部分）：移除挂单敞口，添加已成交订单敞口
-                        self.risk_manager.remove_exposure(update["market_id"], update["remove_exposure"])
-                        self.risk_manager.add_filled_order_exposure(
-                            update["market_id"],
-                            update["add_filled_exposure"]["price"],
-                            update["add_filled_exposure"]["size"]
-                        )
-                    elif update["type"] == "sell_filled":
-                        # 卖单成交：移除挂单敞口
-                        self.risk_manager.remove_exposure(update["market_id"], update["remove_exposure"])
-                        # 如果是对冲卖单成交，移除对应的已成交订单敞口
-                        market_id = update["market_id"]
-                        token_id = update.get("token_id")
-                        sell_filled_size = update.get("filled_size", 0)
-                        if token_id and market_id in self.filled_buy_orders:
-                            with self.lock:
-                                # 只读取数据，不调用可能获取锁的方法
-                                filled_buy_orders_copy = list(self.filled_buy_orders[market_id])
-                            for filled_buy in filled_buy_orders_copy:
-                                if filled_buy.get("token_id") == token_id:
-                                    buy_price = filled_buy.get("price", 0)
-                                    buy_filled_size = filled_buy.get("filled_size", 0)
-                                    # 移除已成交订单的敞口（对冲卖出后，不再占用资金）
-                                    self.risk_manager.remove_filled_order_exposure(
-                                        market_id,
-                                        buy_price,
-                                        min(sell_filled_size, buy_filled_size)  # 取较小值
-                                    )
-                                    logger.info(
-                                        f"对冲卖单成交，移除已成交订单敞口: 市场={market_id}, "
-                                        f"token={token_id[:20]}..., 份额={min(sell_filled_size, buy_filled_size)}"
-                                    )
-                                    break
-                    elif update["type"] == "cancelled":
-                        # 订单取消：移除挂单敞口
-                        self.risk_manager.remove_exposure(update["market_id"], update["remove_exposure"])
-                except Exception as e:
-                    logger.error(f"更新风险敞口时发生错误: {e}")
-            
-            # 注意：对冲卖出逻辑已由 check_positions_and_hedge() 方法处理，不再在此处处理
-            # 补单逻辑由主循环根据返回的 filled_orders_by_market 处理
-            
-            if filled_orders_by_market:
-                total_filled = sum(len(orders) for orders in filled_orders_by_market.values())
-                logger.info(f"检测到 {total_filled} 个订单已成交，{cancelled_count} 个订单已取消")
-            
-            # 检查需要双边挂单的市场：如果只有一边有活跃订单，取消这些订单
-            self._check_and_cancel_single_side_orders()
-            
-        except Exception as e:
-            logger.error(f"检查订单状态失败: {e}")
-        
-        return filled_orders_by_market
-    
+
     def _check_and_cancel_single_side_orders(self) -> None:
         """
         检查需要双边挂单的市场，如果只有一边有活跃订单，取消这些订单
@@ -3236,7 +2941,7 @@ class OrderManager:
             return None
         
         # 规范化价格（确保符合 Polymarket 规范）
-        # 买单不进行规范化，卖单需要进行规范化
+        # 买单向下取整，卖单向上取整（由 place_order 统一处理）
         if side == "SELL":
             market = self.market_data_cache.get(market_id)
             price = self.strategy.normalize_price(
@@ -3845,8 +3550,6 @@ class OrderManager:
                     purpose="REWARD_BUY",
                 )
                 results[token_id] = result is not None
-                if result:
-                    self.metrics["buys_placed"] += 1
         return results
     
     def get_active_orders(self, market_id: Optional[str] = None) -> Dict[str, Any]:
@@ -4397,10 +4100,10 @@ class OrderManager:
                                 current_orderbook, buy_price, sell_price, order_size_for_check, actual_buy_price
                             )
                             
-                            # 买单不进行规范化，直接使用 actual_buy_price（原始买二价或奖励下边界）
+                            # 买单使用 actual_buy_price（已按 BUY 方向取整）
                             # 因为原始买二价一定是能下单的价格，奖励下边界是两位小数也一定能下单
                             target_price = actual_buy_price
-                            logger.info(f"  使用实际挂单价格（不规范化）: {target_price:.4f} (原始买二价或奖励下边界: {actual_buy_price:.4f})")
+                            logger.info(f"  使用实际挂单价格: {target_price:.4f} (原始买二价或奖励下边界: {actual_buy_price:.4f})")
                             logger.info(f"  计算的实际挂单价格（规范化后）: {target_price:.4f} (原始买二价: {actual_buy_price:.4f})")
                             
                             # 如果不能安全挂单，跳过重新挂单，但记录到 pending_reorder_tokens 中
@@ -4433,7 +4136,7 @@ class OrderManager:
                                 # 注意：target_price 现在已经是规范化后的 actual_buy_price（买二价或奖励下边界）
                         else:
                             # 无法获取奖励区间，使用目标价格
-                            # 买单不进行规范化，卖单需要进行规范化
+                            # 买单向下取整，卖单向上取整（由 place_order 统一处理）
                             if side == "SELL":
                                 market = self.market_data_cache.get(market_id)
                                 target_price = self.strategy.normalize_price(
@@ -4449,7 +4152,7 @@ class OrderManager:
                             f"  警告：无法获取最新订单簿数据，无法进行安全挂单检查。"
                             f"将使用目标价格 {target_price:.4f} 重新挂单。"
                         )
-                        # 买单不进行规范化，卖单需要进行规范化
+                        # 买单向下取整，卖单向上取整（由 place_order 统一处理）
                         if side == "SELL":
                             market = self.market_data_cache.get(market_id)
                             target_price = self.strategy.normalize_price(
@@ -4591,7 +4294,7 @@ class OrderManager:
                                 current_orderbook, buy_price, sell_price, order_size_for_check, actual_buy_price
                             )
                             
-                            # 买单不进行规范化，直接使用 actual_buy_price（原始买二价或奖励下边界）
+                            # 买单使用 actual_buy_price（已按 BUY 方向取整）
                             target_price = actual_buy_price
                             
                             # 如果不能安全挂单，更新 last_attempt_time，继续保留在列表中
@@ -4612,7 +4315,7 @@ class OrderManager:
                                 logger.info(f"  风险管理检查通过: {safety_info['reason']}，可以重新挂单")
                         else:
                             # 无法获取奖励区间，使用目标价格
-                            # 买单不进行规范化，卖单需要进行规范化
+                            # 买单向下取整，卖单向上取整（由 place_order 统一处理）
                             if side == "SELL":
                                 market = self.market_data_cache.get(market_id)
                                 target_price = self.strategy.normalize_price(
@@ -4628,7 +4331,7 @@ class OrderManager:
                             f"  警告：无法获取最新订单簿数据，无法进行安全挂单检查。"
                             f"将使用目标价格 {target_price:.4f} 重新挂单。"
                         )
-                        # 买单不进行规范化，卖单需要进行规范化
+                        # 买单向下取整，卖单向上取整（由 place_order 统一处理）
                         if side == "SELL":
                             market = self.market_data_cache.get(market_id)
                             target_price = self.strategy.normalize_price(
@@ -4741,6 +4444,9 @@ class OrderManager:
             # 统计已成交买单
             for market_id, filled_orders in self.filled_buy_orders.items():
                 stats["filled_buy_orders_count"] += len(filled_orders)
+
+            # 轻量观测指标
+            stats["metrics"] = dict(self.metrics)
         
         return stats
 
