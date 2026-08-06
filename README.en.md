@@ -9,7 +9,7 @@ Automated market-making on Polymarket liquidity rewards—place orders to earn r
 
 ## Quick Start
 
-**No Python required.** Download the archive for **[Releases](https://github.com/crazygirl437/Polymarket-Rewards/releases/tag/V1.0)** , extract, and run.
+**No Python required.** Download the archive for **[Releases](../../releases/latest)** , extract, and run.
 
 | Platform | Archive | Contents |
 |----------|---------|----------|
