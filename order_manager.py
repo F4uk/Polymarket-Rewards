@@ -638,10 +638,34 @@ class OrderManager:
         tick_size = self.strategy.get_order_price_min_tick_size(
             self.market_data_cache.get(market_id)
         )
-        loss_per_unit = max(0.0, entry_price - best_bid)
+        downside_gap = max(0.0, entry_price - best_bid)
+        loss_per_unit = downside_gap
         loss_ticks = round(loss_per_unit / tick_size, 10)
         loss_bps = (loss_per_unit / entry_price * 10000.0) if entry_price > 0 else 0.0
         spread = (normalized.best_ask - best_bid) if normalized.best_ask is not None else 0.0
+        passive_price = self.strategy.round_price_to_tick(
+            entry_price,
+            tick_size,
+            "SELL",
+        )
+        executable_bid = self.strategy.immediate_exit_price(best_bid, tick_size)
+
+        fast = (
+            loss_ticks <= config.exit_immediate_max_loss_ticks
+            and loss_bps <= config.exit_immediate_max_loss_bps
+            and (
+                best_bid >= entry_price
+                or downside_gap <= config.hedge_sell_max_bid_gap
+            )
+        )
+        emergency_cross_allowed = (
+            loss_ticks <= config.exit_emergency_loss_ticks
+            and loss_bps <= config.exit_emergency_loss_bps
+            and (
+                best_bid >= entry_price
+                or downside_gap <= config.hedge_sell_max_bid_gap
+            )
+        )
 
         with self.lock:
             current = self.inventory_exits.get(token_id)
@@ -675,63 +699,67 @@ class OrderManager:
                 emergency = True
                 current.pop("_depth_dropped", None)
 
-        fast = (
-            loss_ticks <= config.exit_immediate_max_loss_ticks
-            and loss_bps <= config.exit_immediate_max_loss_bps
-        )
-
         with self.lock:
             current = self.inventory_exits.get(token_id)
             if current is None:
                 return
             current_state = current.get("state")
+            sell_id = current.get("sell_order_id")
+            sell_status = current.get("sell_order_status")
+            active_sell = self.active_orders.get(market_id, {}).get(token_id, {}).get("SELL")
+            existing_price = active_sell.get("price") if active_sell else None
 
         if emergency or current_state == "EMERGENCY_EXIT":
+            desired_price = executable_bid if emergency_cross_allowed else passive_price
+            purpose = "EMERGENCY_EXIT"
             with self.lock:
                 current = self.inventory_exits.get(token_id)
                 if current is not None:
                     current["state"] = "EMERGENCY_EXIT"
                     current["last_action_at"] = now
-            sell_id = state.get("sell_order_id")
-            sell_status = state.get("sell_order_status")
-            if sell_id and sell_status in ("PENDING_CONFIRMATION", "LIVE", "CANCEL_PENDING"):
-                self.cancel_order(sell_id)
-                with self.lock:
-                    current = self.inventory_exits.get(token_id)
-                    if current is not None:
-                        # 取消传播期间保留旧订单身份与待确认份额：
-                        # 在确认取消前不得提交覆盖相同库存的新 SELL。
-                        current["sell_order_status"] = "CANCEL_PENDING"
-                return
-            exit_price = self.strategy.immediate_exit_price(best_bid, tick_size)
-            self._submit_inventory_sell(
-                token_id, exit_price, state["remaining_size"], "EMERGENCY_EXIT"
-            )
-            return
-
-        if fast:
+        elif fast:
+            desired_price = executable_bid
+            purpose = "FAST_EXIT"
             with self.lock:
                 current = self.inventory_exits.get(token_id)
                 if current is not None:
                     current["state"] = "FAST_EXIT"
                     current["last_action_at"] = now
-            exit_price = self.strategy.immediate_exit_price(best_bid, tick_size)
-            self._submit_inventory_sell(
-                token_id, exit_price, state["remaining_size"], "FAST_EXIT"
-            )
+        else:
+            # LIMITED_WAIT：被动卖出，等待时间有限，不跨 best bid。
+            desired_price = passive_price
+            purpose = "LIMITED_WAIT_EXIT"
+            with self.lock:
+                current = self.inventory_exits.get(token_id)
+                if current is not None:
+                    current["state"] = "LIMITED_WAIT"
+                    current["last_action_at"] = now
+
+        if sell_id and sell_status in (
+            "PENDING_CONFIRMATION",
+            "LIVE",
+            "CANCEL_PENDING",
+            "UNKNOWN",
+        ):
+            if sell_status == "CANCEL_PENDING" or sell_status == "UNKNOWN":
+                return
+            if (
+                existing_price is not None
+                and abs(existing_price - desired_price) <= 1e-9
+            ):
+                return
+            self.cancel_order(sell_id)
+            with self.lock:
+                current = self.inventory_exits.get(token_id)
+                if current is not None:
+                    # 取消传播期间保留旧订单身份与待确认份额：
+                    # 在确认取消前不得提交覆盖相同库存的新 SELL。
+                    current["sell_order_status"] = "CANCEL_PENDING"
             return
 
-        # LIMITED_WAIT：被动卖出，等待时间有限
-        with self.lock:
-            current = self.inventory_exits.get(token_id)
-            if current is not None:
-                current["state"] = "LIMITED_WAIT"
-                current["last_action_at"] = now
-        if not state.get("sell_order_id") or state.get("sell_order_status") in ("CANCELLED", "FAILED"):
-            passive_price = self.strategy.round_price_to_tick(entry_price, tick_size, "SELL")
-            self._submit_inventory_sell(
-                token_id, passive_price, state["remaining_size"], "LIMITED_WAIT_EXIT"
-            )
+        self._submit_inventory_sell(
+            token_id, desired_price, state["remaining_size"], purpose
+        )
 
     def _confirm_inventory_sells(self, token_id: str) -> None:
         """Confirm SELL fills via trades (primary) and positions (cross-check)."""
@@ -1133,8 +1161,8 @@ class OrderManager:
         market = self.market_data_cache.get(market_id)
         tick_size = self.strategy.get_order_price_min_tick_size(market)
         if purpose in ("FAST_EXIT", "EMERGENCY_EXIT"):
-            # 立即退出卖价已由 immediate_exit_price 向下对齐到 tick 且不高于 best bid；
-            # 此处禁止再次向上取整，否则会离开可成交价格。
+            # 退出卖价已由策略完成 tick 规范化；
+            # 此处禁止再次取整，避免在 gap 内使用 best bid 时向上偏离可成交价。
             price = round(float(price), 10)
         else:
             price = self.strategy.round_price_to_tick(price, tick_size, side)

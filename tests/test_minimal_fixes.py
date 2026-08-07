@@ -103,13 +103,13 @@ def test_partial_fill_exposure_recorded_once(fake_clock):
 
 
 def test_sell_cancel_propagation_late_fill_no_oversell(fake_clock):
-    om, clob = _make_om(fake_clock, {TOKEN_A: _book(fake_clock, best_bid=0.56)})
+    om, clob = _make_om(fake_clock, {TOKEN_A: _book(fake_clock, best_bid=0.57)})
     assert om._handle_buy_fill("market-1", TOKEN_A, 0.60, 100.0)
     state = om.inventory_exits[TOKEN_A]
     old_sell_id = state["sell_order_id"]
     assert old_sell_id is not None
 
-    # 深度进一步恶化 -> 紧急退出要求取消旧 SELL
+    # 深度进一步恶化到保护区间 -> 需要取消旧 SELL 并重新挂保护价
     om.api_client.orderbook_source.orderbooks[TOKEN_A] = _book(fake_clock, best_bid=0.54)
     om.check_inventory_exits()
     state = om.inventory_exits[TOKEN_A]
