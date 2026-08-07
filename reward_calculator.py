@@ -91,6 +91,11 @@ def calculate_q_one_q_two(
     )
     buy_price = max(0.0, mid_price - spread_decimal)
     sell_price = min(1.0, mid_price + spread_decimal)
+
+    # m' 是互补 token，其中点必须使用 1 - mid_price
+    m_prime_mid_price = 1.0 - mid_price
+    m_prime_buy_price = max(0.0, m_prime_mid_price - spread_decimal)
+    m_prime_sell_price = min(1.0, m_prime_mid_price + spread_decimal)
     
     # 处理市场 m 的订单
     bids_m = orderbook_m.get("bids", [])
@@ -131,8 +136,8 @@ def calculate_q_one_q_two(
             ask_size = float(ask.get("size", 0))
             
             # 只计算奖励区间范围内的订单
-            if buy_price <= ask_price <= sell_price:
-                s = calculate_spread_cents(ask_price, mid_price)
+            if m_prime_buy_price <= ask_price <= m_prime_sell_price:
+                s = calculate_spread_cents(ask_price, m_prime_mid_price)
                 if s <= v:  # 价差在允许范围内
                     score = calculate_order_score(v, s, b)
                     q_one += score * ask_size
@@ -143,8 +148,8 @@ def calculate_q_one_q_two(
             bid_size = float(bid.get("size", 0))
             
             # 只计算奖励区间范围内的订单
-            if buy_price <= bid_price <= sell_price:
-                s = calculate_spread_cents(bid_price, mid_price)
+            if m_prime_buy_price <= bid_price <= m_prime_sell_price:
+                s = calculate_spread_cents(bid_price, m_prime_mid_price)
                 if s <= v:  # 价差在允许范围内
                     score = calculate_order_score(v, s, b)
                     q_two += score * bid_size
@@ -244,9 +249,10 @@ def estimate_our_score(
         m_prime_buy_price = 1.0 - our_sell_price  # m 的卖单对应 m' 的买单
         m_prime_sell_price = 1.0 - our_buy_price  # m 的买单对应 m' 的卖单
         
-        # 计算 m' 的价差（使用相同的 mid_price）
-        m_prime_buy_spread = calculate_spread_cents(m_prime_buy_price, mid_price)
-        m_prime_sell_spread = calculate_spread_cents(m_prime_sell_price, mid_price)
+        # 计算 m' 的价差（使用互补中点 1 - mid_price）
+        m_prime_mid_price = 1.0 - mid_price
+        m_prime_buy_spread = calculate_spread_cents(m_prime_buy_price, m_prime_mid_price)
+        m_prime_sell_spread = calculate_spread_cents(m_prime_sell_price, m_prime_mid_price)
         
         # 计算 m' 的评分
         m_prime_buy_score = calculate_order_score(v, m_prime_buy_spread, b) if m_prime_buy_spread <= v else 0.0
