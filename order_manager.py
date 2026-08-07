@@ -3490,6 +3490,28 @@ class OrderManager:
         
         return cancelled_count
 
+    def cancel_reward_buys_for_rescan(self) -> Tuple[int, int]:
+        """Cancel all tracked reward BUY orders before a market rescan.
+
+        Uses the existing per-order cancellation path (cancel_order), which
+        preserves SELL orders, updates exposure/bookkeeping, and records the
+        cancellation for normal cancel-pending reconciliation.
+
+        Returns (cancelled_count, total_count).
+        """
+        buy_order_ids: List[str] = []
+        with self.lock:
+            for market_id, tokens_dict in self.active_orders.items():
+                for token_id, sides_dict in tokens_dict.items():
+                    buy_info = sides_dict.get("BUY")
+                    if buy_info and buy_info.get("order_id"):
+                        buy_order_ids.append(buy_info["order_id"])
+        cancelled_count = 0
+        for order_id in buy_order_ids:
+            if self.cancel_order(order_id):
+                cancelled_count += 1
+        return cancelled_count, len(buy_order_ids)
+
     def remove_market(self, market_id: str) -> int:
         """Remove a market from trading: cancel its BUY orders only.
 

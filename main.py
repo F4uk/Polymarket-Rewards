@@ -451,10 +451,10 @@ def main():
                         # 继续执行，不中断主循环
                         last_orderbook_update = current_time
                 
-                # 4.3 定期重新扫描和筛选市场（差量更新模式）
+                # 4.3 定期重新扫描和筛选市场（先撤 BUY，保留库存 SELL）
                 if current_time - last_market_scan >= config.update_interval_seconds:
                     logger.info("=" * 60)
-                    logger.info("重新扫描和筛选市场（差量更新）...")
+                    logger.info("重新扫描和筛选市场（先撤 BUY，保留库存 SELL）...")
                     logger.info("=" * 60)
                     
                     try:
@@ -462,29 +462,53 @@ def main():
                         previous_market_ids = market_manager.update_selected_market_ids()
                         logger.info(f"上一轮选择市场数: {len(previous_market_ids)}")
 
-                        # 第二步：扫描所有流动性奖励市场
-                        all_markets = market_manager.scan_rewards_markets()
-                        logger.info(f"扫描到 {len(all_markets)} 个有流动性奖励的市场")
-                        
-                        # 第三步：筛选最优市场
-                        new_selected_markets = market_manager.filter_markets()
-                        logger.info(f"筛选出 {len(new_selected_markets)} 个机会市场")
-                        
-                        # 第四步：差量更新（retained 保留，removed 只撤 BUY，added 完整准入后挂单）
-                        new_market_ids = market_manager.get_selected_market_ids()
-                        refresh = order_manager.refresh_market_selection(
-                            previous_market_ids,
-                            new_market_ids,
-                            new_selected_markets,
+                        # 第二步：扫描前取消当前奖励 BUY（保留库存 SELL）
+                        cancelled_buys, total_buys = (
+                            order_manager.cancel_reward_buys_for_rescan()
                         )
-                        logger.info(
-                            f"市场差量更新: retained={len(refresh['retained'])}, "
-                            f"removed={len(refresh['removed'])}, "
-                            f"added={len(refresh['added'])}, "
-                            f"取消 BUY={refresh['cancelled_buys']}, "
-                            f"新挂单市场={refresh['placed_markets']}"
-                        )
-                        
+                        if cancelled_buys != total_buys:
+                            logger.warning(
+                                f"重新扫描前 BUY 取消失败 "
+                                f"{total_buys - cancelled_buys}/{total_buys}，"
+                                f"延迟本次市场扫描"
+                            )
+                        else:
+                            logger.info(f"重新扫描前已取消 {cancelled_buys} 个 BUY")
+
+                            # 第三步：扫描所有流动性奖励市场
+                            all_markets = market_manager.scan_rewards_markets()
+                            logger.info(f"扫描到 {len(all_markets)} 个有流动性奖励的市场")
+
+                            # 第四步：筛选最优市场
+                            new_selected_markets = market_manager.filter_markets()
+                            logger.info(f"筛选出 {len(new_selected_markets)} 个机会市场")
+
+                            # 第五步：差量更新（removed 只撤 BUY，added 完整准入后挂单）
+                            new_market_ids = market_manager.get_selected_market_ids()
+                            refresh = order_manager.refresh_market_selection(
+                                previous_market_ids,
+                                new_market_ids,
+                                new_selected_markets,
+                            )
+
+                            # 保留市场在扫描前已撤 BUY：按完整准入重新挂单
+                            retained_placed = 0
+                            for market in new_selected_markets:
+                                if market.get("market_id") not in refresh["retained"]:
+                                    continue
+                                placed = order_manager.place_market_orders(market, {})
+                                if any(placed.values()):
+                                    retained_placed += 1
+
+                            logger.info(
+                                f"市场差量更新: retained={len(refresh['retained'])}, "
+                                f"removed={len(refresh['removed'])}, "
+                                f"added={len(refresh['added'])}, "
+                                f"取消 BUY={refresh['cancelled_buys']}, "
+                                f"新挂单市场={refresh['placed_markets']}, "
+                                f"保留市场重新挂单={retained_placed}"
+                            )
+
                         last_market_scan = current_time
                     except Exception as e:
                         # 使用 try-except 包裹日志记录，防止日志写入失败导致程序卡死
@@ -498,7 +522,7 @@ def main():
                                 print(f"[错误] 日志写入也失败: {log_error}", file=sys.stderr)
                             except:
                                 pass
-                        # 继续执行，不中断主循环
+                        # 继续执行，不中断主循环；旧 BUY 不自动恢复，下一轮重试
                         last_market_scan = current_time
                 
                 # 短暂休眠，避免 CPU 占用过高
