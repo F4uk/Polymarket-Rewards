@@ -1,12 +1,172 @@
 """
 做市策略模块 - 基于流动性奖励的优化策略
 """
-import math
+from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
+import time
 from typing import Dict, Any, Optional, Tuple
 from config import config
 from logger import setup_logger
 
 logger = setup_logger("market_making_strategy")
+
+# 市场准入原因代码
+ENTRY_ACCEPTED = "ACCEPTED"
+ENTRY_STALE_BOOK = "STALE_BOOK"
+ENTRY_EMPTY_BOOK = "EMPTY_BOOK"
+ENTRY_ONE_SIDED_BOOK = "ONE_SIDED_BOOK"
+ENTRY_CROSSED_BOOK = "CROSSED_BOOK"
+ENTRY_SPREAD_TOO_WIDE = "SPREAD_TOO_WIDE"
+ENTRY_NO_SECOND_BID = "NO_SECOND_BID"
+ENTRY_INSUFFICIENT_PROTECTION = "INSUFFICIENT_PROTECTION"
+ENTRY_INSUFFICIENT_EXIT_DEPTH = "INSUFFICIENT_EXIT_DEPTH"
+ENTRY_EXIT_VWAP_TOO_LOSSY = "EXIT_VWAP_TOO_LOSSY"
+ENTRY_PRICE_CLIFF = "PRICE_CLIFF"
+ENTRY_INVALID_BOOK = "INVALID_BOOK"
+
+
+@dataclass
+class EntryDecision:
+    """Result of one market/token entry evaluation."""
+
+    accepted: bool
+    reason: str = ENTRY_INVALID_BOOK
+    token_id: Optional[str] = None
+    details: dict = field(default_factory=dict)
+
+
+def reward_spread_decimal(
+    rewards_max_spread: float,
+    inset_ticks: int = 0,
+    tick_size: float = 0.01,
+) -> float:
+    """Convert rewards_max_spread (cents) to a decimal half-width.
+
+    The only inset is the configured tick-based boundary inset; there is no
+    unexplained fixed one-cent adjustment.
+    """
+    return round(
+        max(
+            0.0,
+            float(rewards_max_spread) / 100.0 - int(inset_ticks) * float(tick_size),
+        ),
+        10,
+    )
+
+
+@dataclass
+class NormalizedOrderbook:
+    """Order-independent standardized view of one token orderbook."""
+
+    normalized_bids: list = field(default_factory=list)
+    normalized_asks: list = field(default_factory=list)
+    best_bid: Optional[float] = None
+    best_ask: Optional[float] = None
+    second_bid: Optional[float] = None
+    is_empty: bool = True
+    is_one_sided: bool = False
+    is_crossed: bool = False
+    received_at: Optional[float] = None
+    age_seconds: Optional[float] = None
+    invalid_rows: int = 0
+
+
+def _aggregate_levels(levels: Optional[list]) -> Tuple[list, int]:
+    """Aggregate raw orderbook levels by exact price, returning sorted floats.
+
+    Unparseable prices, out-of-range prices, and non-positive sizes are ignored.
+    """
+    aggregated: Dict[Decimal, Decimal] = {}
+    invalid = 0
+    for level in levels or []:
+        try:
+            price = Decimal(str(level.get("price")))
+            size = Decimal(str(level.get("size")))
+        except (InvalidOperation, TypeError, ValueError):
+            invalid += 1
+            continue
+        if not price.is_finite() or not size.is_finite():
+            invalid += 1
+            continue
+        if price < 0 or price > 1 or size <= 0:
+            invalid += 1
+            continue
+        aggregated[price] = aggregated.get(price, Decimal(0)) + size
+    return [
+        (float(price), float(size))
+        for price, size in sorted(aggregated.items(), key=lambda kv: kv[0])
+    ], invalid
+
+
+def normalize_orderbook(
+    orderbook: Optional[Dict[str, Any]],
+    now_monotonic: Optional[float] = None,
+) -> NormalizedOrderbook:
+    """Single orderbook standardization entry point.
+
+    Produces sorted aggregated price levels, best/second prices, book health
+    flags, and a monotonic age. The caller-provided list is never mutated.
+
+    Args:
+        orderbook: raw orderbook dict with "bids"/"asks" lists.
+        now_monotonic: monotonic clock value; defaults to time.monotonic().
+
+    Returns:
+        NormalizedOrderbook.
+    """
+    if now_monotonic is None:
+        now_monotonic = time.monotonic()
+    if not orderbook:
+        return NormalizedOrderbook(
+            received_at=None,
+            age_seconds=None,
+        )
+
+    raw_bids = orderbook.get("bids", [])
+    raw_asks = orderbook.get("asks", [])
+    bids_asc, invalid_bids = _aggregate_levels(raw_bids)
+    asks_asc, invalid_asks = _aggregate_levels(raw_asks)
+
+    normalized_bids = list(reversed(bids_asc))  # price high -> low
+    normalized_asks = asks_asc  # price low -> high
+
+    best_bid = normalized_bids[0][0] if normalized_bids else None
+    best_ask = normalized_asks[0][0] if normalized_asks else None
+
+    second_bid = None
+    if len(normalized_bids) >= 2:
+        # normalized_bids is price-desc and aggregated, so index 1 is a
+        # strictly lower distinct price by construction.
+        second_bid = normalized_bids[1][0]
+
+    received_at = orderbook.get("_received_at")
+    if received_at is None:
+        received_at = orderbook.get("received_at")
+    age_seconds = None
+    if received_at is not None and now_monotonic is not None:
+        age_seconds = max(0.0, float(now_monotonic) - float(received_at))
+
+    is_empty = not normalized_bids and not normalized_asks
+    is_one_sided = (not normalized_bids) != (not normalized_asks)
+    is_crossed = (
+        best_bid is not None
+        and best_ask is not None
+        and best_bid >= best_ask
+    )
+
+    return NormalizedOrderbook(
+        normalized_bids=normalized_bids,
+        normalized_asks=normalized_asks,
+        best_bid=best_bid,
+        best_ask=best_ask,
+        second_bid=second_bid,
+        is_empty=is_empty,
+        is_one_sided=is_one_sided,
+        is_crossed=is_crossed,
+        received_at=received_at,
+        age_seconds=age_seconds,
+        invalid_rows=invalid_bids + invalid_asks,
+    )
 
 
 class MarketMakingStrategy:
@@ -75,26 +235,14 @@ class MarketMakingStrategy:
         Returns:
             推断出的 tick_size，如果无法推断则返回 0.01（默认值）
         """
-        bids = orderbook.get("bids", [])
-        asks = orderbook.get("asks", [])
+        normalized = normalize_orderbook(orderbook)
         
         # 收集所有价格，检查小数位数
         all_prices = []
-        for bid in bids[:10]:  # 只检查前10个，避免性能问题
-            price = bid.get("price")
-            if price:
-                try:
-                    all_prices.append(float(price))
-                except (ValueError, TypeError):
-                    continue
-        
-        for ask in asks[:10]:  # 只检查前10个
-            price = ask.get("price")
-            if price:
-                try:
-                    all_prices.append(float(price))
-                except (ValueError, TypeError):
-                    continue
+        for price, _ in normalized.normalized_bids[:10]:
+            all_prices.append(price)
+        for price, _ in normalized.normalized_asks[:10]:
+            all_prices.append(price)
         
         if not all_prices:
             return 0.01  # 默认值
@@ -128,24 +276,70 @@ class MarketMakingStrategy:
         Returns:
             中间价格，如果无法计算则返回 None
         """
-        bids = orderbook.get("bids", [])
-        asks = orderbook.get("asks", [])
-        
-        if not bids or not asks:
+        normalized = normalize_orderbook(orderbook)
+
+        if normalized.is_empty or normalized.is_one_sided:
             return None
-        
-        # best_bid = 最高买价（bids[-1]，按价格降序排列）
-        # best_ask = 最低卖价（asks[-1]，按价格升序排列）
-        best_bid = float(bids[-1].get("price", 0))
-        best_ask = float(asks[-1].get("price", 0))
-        
-        if best_bid <= 0 or best_ask <= 0:
+
+        if normalized.best_bid is None or normalized.best_ask is None:
             return None
-        
-        mid_price = (best_bid + best_ask) / 2
+
+        mid_price = (normalized.best_bid + normalized.best_ask) / 2
         return mid_price
     
-    def normalize_price(self, price: float, order_price_min_tick_size: Optional[float] = None) -> float:
+    def round_price_to_tick(
+        self,
+        price: float,
+        order_price_min_tick_size: Optional[float] = None,
+        side: str = "BUY",
+    ) -> float:
+        """Round a price to the market tick size with an explicit side.
+
+        BUY rounds down (never raises execution risk), SELL rounds up (never
+        lowers the planned sell price). Unknown sides are rejected. The result
+        is clamped to the legal tick-aligned range and returned as a float.
+        """
+        if side not in ("BUY", "SELL"):
+            raise ValueError(f"未知的订单方向: {side}，必须为 BUY 或 SELL")
+
+        tick_size = 0.01
+        if order_price_min_tick_size is not None:
+            tick_size = float(order_price_min_tick_size)
+        if tick_size <= 0 or tick_size not in (0.1, 0.01, 0.001, 0.0001):
+            tick_size = 0.01
+
+        tick = Decimal(str(tick_size))
+        value = Decimal(str(price))
+        rounding = ROUND_FLOOR if side == "BUY" else ROUND_CEILING
+        steps = (value / tick).to_integral_value(rounding=rounding)
+        rounded = steps * tick
+
+        # 合法价格范围：最低为 0.01 与 tick 的较大者（保证 tick 对齐），最高为 1.0
+        lower = max(Decimal("0.01"), tick)
+        rounded = min(max(rounded, lower), Decimal("1.0"))
+        rounded = rounded.quantize(tick)
+        return float(rounded)
+
+    def immediate_exit_price(
+        self,
+        best_bid: float,
+        order_price_min_tick_size: Optional[float] = None,
+    ) -> float:
+        """Tick-aligned price that stays at or below the best bid.
+
+        Used only for SELL orders whose purpose is immediate execution; the
+        price is floored to the tick so it can never round above the best bid
+        and lose executability.
+        """
+        price = self.round_price_to_tick(best_bid, order_price_min_tick_size, "BUY")
+        return min(price, float(best_bid))
+
+    def normalize_price(
+        self,
+        price: float,
+        order_price_min_tick_size: Optional[float] = None,
+        side: str = "BUY",
+    ) -> float:
         """
         规范化价格：根据市场的最小价格步长（orderPriceMinTickSize）向下取整，并限制在有效范围内 [0.01, 1.0]
         
@@ -185,21 +379,7 @@ class MarketMakingStrategy:
                 else:
                     decimal_places = 0
         
-        # 向下取整到最小价格步长的倍数
-        # 例如：如果 tick_size = 0.01，价格 0.156 会变成 0.15
-        # 例如：如果 tick_size = 0.001，价格 0.1567 会变成 0.156
-        if tick_size > 0:
-            normalized = math.floor(float(price) / tick_size) * tick_size
-        else:
-            normalized = float(price)
-        
-        # 四舍五入到指定小数位数（避免浮点数精度问题）
-        normalized = round(normalized, decimal_places)
-        
-        # 限制在有效范围内 [0.01, 1.0]
-        normalized = max(0.01, min(1.0, normalized))
-        
-        return normalized
+        return self.round_price_to_tick(price, order_price_min_tick_size, side=side)
     
     def round_price(self, price: float) -> float:
         """
@@ -235,21 +415,22 @@ class MarketMakingStrategy:
             买单价格 = 中间价 - rewards_max_spread
             卖单价格 = 中间价 + rewards_max_spread
         """
-        # rewards_max_spread 是美分，需要转换为小数
-        # 例如 3.5 美分 = 0.035
-        spread = (rewards_max_spread - 1) / 100
+        # rewards_max_spread 是美分，需要转换为小数；唯一缩进来自配置的 tick 数
+        tick_size = self.get_order_price_min_tick_size(market)
+        spread = reward_spread_decimal(
+            rewards_max_spread,
+            config.reward_boundary_inset_ticks,
+            tick_size,
+        )
         
         # 买单价格 = 中间价 - rewards_max_spread
         buy_price = mid_price - spread
         # 卖单价格 = 中间价 + rewards_max_spread
         sell_price = mid_price + spread
         
-        # 获取市场的最小价格步长
-        tick_size = self.get_order_price_min_tick_size(market)
-        
-        # 规范化价格（根据市场的最小价格步长四舍五入，并限制在有效范围内 [0.01, 1.0]）
-        buy_price = self.normalize_price(buy_price, tick_size)
-        sell_price = self.normalize_price(sell_price, tick_size)
+        # 方向性取整：BUY 向下、SELL 向上
+        buy_price = self.round_price_to_tick(buy_price, tick_size, "BUY")
+        sell_price = self.round_price_to_tick(sell_price, tick_size, "SELL")
         
         return buy_price, sell_price
     
@@ -257,7 +438,6 @@ class MarketMakingStrategy:
         self,
         orderbook: Dict[str, Any],
         rewards_max_spread: float,
-        use_conservative_price: bool = False,
         market: Optional[Dict[str, Any]] = None
     ) -> Optional[Dict[str, float]]:
         """
@@ -266,7 +446,6 @@ class MarketMakingStrategy:
         Args:
             orderbook: 订单簿数据
             rewards_max_spread: 奖励最大价差（美分）
-            use_conservative_price: 是否使用保守价格（数据过期时使用，使用极低/极高价格避免成交）
             market: 市场数据字典（可选，用于获取 orderPriceMinTickSize）
             
         Returns:
@@ -274,21 +453,6 @@ class MarketMakingStrategy:
         """
         # 获取市场的最小价格步长
         tick_size = self.get_order_price_min_tick_size(market)
-        
-        # 如果使用保守价格（数据过期时），使用极低/极高价格，几乎不会被成交
-        if use_conservative_price:
-            buy_price = 0.01  # 极低价格，几乎不会被成交
-            sell_price = 0.99  # 极高价格，几乎不会被成交
-            logger.debug(
-                f"使用保守价格（数据过期）: 买入价={buy_price:.2f}, 卖出价={sell_price:.2f}"
-            )
-            return {
-                "mid_price": 0.50,  # 占位值，实际不使用
-                "buy_price": buy_price,
-                "sell_price": sell_price,
-                "reward_min_price": buy_price,
-                "reward_max_price": sell_price
-            }
         
         mid_price = self.calculate_mid_price(orderbook)
         if mid_price is None:
@@ -310,6 +474,195 @@ class MarketMakingStrategy:
             "reward_min_price": buy_price,
             "reward_max_price": sell_price
         }
+
+    def _simulate_exit(
+        self,
+        normalized_bids: list,
+        order_size: float,
+        entry_price: float,
+        min_depth_multiplier: float,
+        price_cliff_threshold: float,
+    ) -> dict:
+        """Simulate selling ``order_size`` against the bid book.
+
+        Returns coverage, VWAP, worst price, tick/bps loss, depth multiplier,
+        and whether an obvious price cliff must be crossed.
+        """
+        needed = max(0.0, float(order_size)) * float(min_depth_multiplier)
+        cumulative = 0.0
+        weighted = 0.0
+        worst_price = None
+        levels_needed = 0
+        cliff_detected = False
+        previous_price = None
+
+        for price, size in normalized_bids:
+            if previous_price is not None:
+                gap = previous_price - price
+                if gap > price_cliff_threshold:
+                    cliff_detected = True
+            previous_price = price
+
+            take = min(size, max(0.0, needed - cumulative))
+            if take <= 0:
+                break
+            cumulative += take
+            weighted += take * price
+            worst_price = price
+            levels_needed += 1
+
+        vwap = (weighted / cumulative) if cumulative > 0 else 0.0
+        loss_per_unit = float(entry_price) - vwap
+        loss_ticks = 0.0
+        if loss_per_unit > 0:
+            # 使用 0.01 作为 loss_ticks 的基准单位（tick 损失按价格差/0.01 计）
+            loss_ticks = loss_per_unit / 0.01
+        loss_bps = (loss_per_unit / float(entry_price) * 10000.0) if entry_price > 0 else 0.0
+        depth_multiplier = (cumulative / float(order_size)) if order_size > 0 else 0.0
+
+        return {
+            "needed": needed,
+            "cumulative_size": cumulative,
+            "levels_needed": levels_needed,
+            "vwap": vwap,
+            "worst_fill_price": worst_price,
+            "loss_ticks": max(0.0, loss_ticks),
+            "loss_bps": max(0.0, loss_bps),
+            "depth_multiplier": depth_multiplier,
+            "cliff_detected": cliff_detected,
+        }
+
+    def evaluate_token_entry(
+        self,
+        token_id: str,
+        orderbook: Optional[Dict[str, Any]],
+        market: Optional[Dict[str, Any]] = None,
+        order_size: Optional[float] = None,
+        now_monotonic: Optional[float] = None,
+    ) -> EntryDecision:
+        """Full entry gate for one token (freshness, spread, safety, exit depth)."""
+        if not orderbook:
+            return EntryDecision(False, ENTRY_INVALID_BOOK, token_id, {"error": "missing orderbook"})
+
+        normalized = normalize_orderbook(orderbook, now_monotonic=now_monotonic)
+        details: dict = {
+            "best_bid": normalized.best_bid,
+            "best_ask": normalized.best_ask,
+            "age_seconds": normalized.age_seconds,
+        }
+
+        if normalized.is_empty:
+            return EntryDecision(False, ENTRY_EMPTY_BOOK, token_id, details)
+        if normalized.is_one_sided:
+            return EntryDecision(False, ENTRY_ONE_SIDED_BOOK, token_id, details)
+        if normalized.is_crossed:
+            return EntryDecision(False, ENTRY_CROSSED_BOOK, token_id, details)
+        if normalized.best_bid is None or normalized.best_ask is None:
+            return EntryDecision(False, ENTRY_INVALID_BOOK, token_id, details)
+        if normalized.age_seconds is None or normalized.age_seconds > config.max_orderbook_age_seconds:
+            return EntryDecision(False, ENTRY_STALE_BOOK, token_id, details)
+
+        spread = normalized.best_ask - normalized.best_bid
+        details["spread"] = spread
+        max_spread = config.spread_range.get("max")
+        if max_spread is not None and spread > max_spread:
+            return EntryDecision(False, ENTRY_SPREAD_TOO_WIDE, token_id, details)
+
+        if market is None:
+            market = {}
+        rewards_max_spread = market.get("rewards_max_spread", 0)
+        if not rewards_max_spread:
+            return EntryDecision(False, ENTRY_INVALID_BOOK, token_id, details)
+
+        prices = self.calculate_order_prices(orderbook, rewards_max_spread, market=market)
+        if not prices:
+            return EntryDecision(False, ENTRY_INVALID_BOOK, token_id, details)
+
+        actual_buy_price = self.calculate_actual_buy_price(orderbook, prices["buy_price"])
+        details["actual_buy_price"] = actual_buy_price
+        if actual_buy_price is None:
+            return EntryDecision(False, ENTRY_NO_SECOND_BID, token_id, details)
+
+        if order_size is None:
+            order_size = self.calculate_order_size(market)
+        details["order_size"] = order_size
+
+        can_place, safety_info = self.can_place_buy_order_safely(
+            orderbook,
+            prices["buy_price"],
+            prices["sell_price"],
+            order_size,
+            actual_buy_price,
+        )
+        if not can_place:
+            reason_text = safety_info.get("reason", "")
+            if "价格断层" in reason_text or "断层" in reason_text:
+                reason = ENTRY_PRICE_CLIFF
+            elif "保护份额" in reason_text:
+                reason = ENTRY_INSUFFICIENT_PROTECTION
+            else:
+                reason = ENTRY_NO_SECOND_BID
+            details["safety_reason"] = reason_text
+            return EntryDecision(False, reason, token_id, details)
+
+        # 退出能力模拟：按 bids 从高到低累计
+        simulation = self._simulate_exit(
+            normalized.normalized_bids,
+            order_size,
+            actual_buy_price,
+            config.min_exit_depth_multiplier,
+            config.price_cliff_threshold,
+        )
+        details["exit_simulation"] = simulation
+
+        if simulation["cumulative_size"] < simulation["needed"]:
+            return EntryDecision(False, ENTRY_INSUFFICIENT_EXIT_DEPTH, token_id, details)
+        if simulation["cliff_detected"]:
+            return EntryDecision(False, ENTRY_PRICE_CLIFF, token_id, details)
+        if simulation["loss_bps"] > config.exit_immediate_max_loss_bps:
+            return EntryDecision(False, ENTRY_EXIT_VWAP_TOO_LOSSY, token_id, details)
+        # 买盘顶层极小档位视为不稳定保护
+        if normalized.normalized_bids:
+            top_size = normalized.normalized_bids[0][1]
+            if top_size < float(order_size) * 0.1:
+                details["safety_reason"] = "买一价档位过小，保护不稳定"
+                return EntryDecision(False, ENTRY_INSUFFICIENT_PROTECTION, token_id, details)
+
+        details["accepted"] = True
+        return EntryDecision(True, ENTRY_ACCEPTED, token_id, details)
+
+    def evaluate_market_entry(
+        self,
+        market: Dict[str, Any],
+        orderbooks_dict: Dict[str, Dict[str, Any]],
+        order_size: Optional[float] = None,
+        now_monotonic: Optional[float] = None,
+    ) -> EntryDecision:
+        """Gate the whole market: every required token must pass.
+
+        A liquid token can never mask an illiquid one.
+        """
+        tokens = market.get("tokens", [])
+        details: dict = {"tokens": {}}
+        for token in tokens:
+            token_id = token.get("token_id")
+            if not token_id:
+                continue
+            decision = self.evaluate_token_entry(
+                token_id,
+                orderbooks_dict.get(token_id),
+                market=market,
+                order_size=order_size,
+                now_monotonic=now_monotonic,
+            )
+            details["tokens"][token_id] = {
+                "accepted": decision.accepted,
+                "reason": decision.reason,
+                "details": decision.details,
+            }
+            if not decision.accepted:
+                return EntryDecision(False, decision.reason, token_id, details)
+        return EntryDecision(True, ENTRY_ACCEPTED, None, details)
     
     def calculate_order_size(
         self,
@@ -391,8 +744,11 @@ class MarketMakingStrategy:
             profit = min_profit_margin_bps / 10000  # 基点转小数
             sell_price = base_price + profit
         
-        # 规范化价格（根据市场的最小价格步长四舍五入，并限制在有效范围内 [0.01, 1.0]）
-        sell_price = self.normalize_price(sell_price, tick_size)
+        # 使用买一价时保持可成交（不得因取整高于买一价）；否则被动卖出向上取整
+        if best_bid_price is not None and sell_price == best_bid_price:
+            sell_price = self.immediate_exit_price(best_bid_price, tick_size)
+        else:
+            sell_price = self.round_price_to_tick(sell_price, tick_size, "SELL")
         
         logger.debug(
             f"对冲卖出价计算: 买入价={buy_price:.2f}, "
@@ -446,25 +802,15 @@ class MarketMakingStrategy:
         Returns:
             实际挂单价格，如果无法计算（只有买一价）则返回 None
         """
-        bids = orderbook.get("bids", [])
-        
-        if not bids:
+        normalized = normalize_orderbook(orderbook)
+
+        if not normalized.normalized_bids:
             return None
-        
-        # 获取买一价（最高买价）
-        best_bid_price = float(bids[-1].get("price", 0))
-        
-        # 找买二价（第二高的买价，价格低于买一价）
-        second_bid_price = None
-        if len(bids) >= 2:
-            # 从后往前找，找到第一个价格低于买一价的买单
-            for i in range(len(bids) - 2, -1, -1):
-                bid_price = float(bids[i].get("price", 0))
-                if bid_price < best_bid_price:
-                    second_bid_price = bid_price
-                    break
-        
-        # 如果订单簿只有买一价（没有买二价），返回 None（跳过）
+
+        best_bid_price = normalized.best_bid
+        second_bid_price = normalized.second_bid
+
+        # 只有买一价（没有不同的第二档价格）时无法挂买二价
         if second_bid_price is None:
             return None
         
@@ -475,7 +821,8 @@ class MarketMakingStrategy:
         
         # 如果买二价 < buy_price（奖励下边界），返回 buy_price（奖励下边界）
         # 因为使用奖励下边界挂单后，买二价在我们后面，我们就是买二价
-        return buy_price
+        tick_size = self.infer_tick_size_from_orderbook(orderbook)
+        return self.round_price_to_tick(buy_price, tick_size, "BUY")
     
     def can_place_buy_order_safely(
         self,
@@ -504,7 +851,8 @@ class MarketMakingStrategy:
             can_place: True 表示可以安全挂单，False 表示不能挂单
             info_dict: 包含详细信息，用于日志输出
         """
-        bids = orderbook.get("bids", [])
+        normalized = normalize_orderbook(orderbook)
+        bids = normalized.normalized_bids  # [(price, size)] 价格从高到低、已聚合同价档位
         
         # 统计价格高于、等于、低于 actual_buy_price 的买单
         bids_above_actual_price = []  # 价格 > actual_buy_price 的买单（排在我们前面）
@@ -512,8 +860,7 @@ class MarketMakingStrategy:
         bids_below_actual_price = []  # 价格 < actual_buy_price 的买单（排在我们后面）
         bids_in_reward_range = []  # 奖励区间内的买单（用于信息展示）
         
-        for bid in bids:
-            bid_price = float(bid.get("price", 0))
+        for bid_price, _ in bids:
             
             # 统计奖励区间内的买单（用于信息展示）
             if buy_price <= bid_price <= sell_price:
@@ -533,32 +880,15 @@ class MarketMakingStrategy:
         bids_below_actual_price.sort(reverse=True)
         bids_in_reward_range.sort(reverse=True)
         
-        # 计算买一价和买二价
-        best_bid_price = None
+        best_bid_price = normalized.best_bid
         best_bid_size = 0.0
-        second_bid_price = None
+        second_bid_price = normalized.second_bid
         second_bid_size = 0.0
-        
-        if bids:
-            # bids 按价格降序排列，bids[-1] 是最高买价（买一价）
-            best_bid_price = float(bids[-1].get("price", 0))
-            # 买一价的份额 = 所有价格为买一价的买单份额之和
-            for bid in bids:
-                if abs(float(bid.get("price", 0)) - best_bid_price) < 0.0001:  # 考虑浮点数精度
-                    best_bid_size += float(bid.get("size", 0))
-            
-            # 找买二价（第二高的买价，价格低于买一价）
-            if len(bids) >= 2:
-                # 从后往前找，找到第一个价格低于买一价的买单
-                for i in range(len(bids) - 2, -1, -1):
-                    bid_price = float(bids[i].get("price", 0))
-                    if bid_price < best_bid_price:
-                        second_bid_price = bid_price
-                        # 买二价的份额 = 所有价格为买二价的买单份额之和
-                        for bid in bids:
-                            if abs(float(bid.get("price", 0)) - second_bid_price) < 0.0001:  # 考虑浮点数精度
-                                second_bid_size += float(bid.get("size", 0))
-                        break
+
+        if normalized.normalized_bids:
+            best_bid_size = normalized.normalized_bids[0][1]
+            if len(normalized.normalized_bids) >= 2:
+                second_bid_size = normalized.normalized_bids[1][1]
         
         # 判断 actual_buy_price 是否等于买二价
         is_second_bid_price = (second_bid_price is not None and 
@@ -636,12 +966,11 @@ class MarketMakingStrategy:
             price_diff = actual_buy_price - next_price
             
             # 计算该价格层的总份额
-            price_size = 0.0
-            for bid in bids:
-                bid_price = float(bid.get("price", 0))
-                if abs(bid_price - next_price) < 0.0001:  # 考虑浮点数精度
-                    price_size += float(bid.get("size", 0))
-            
+            price_size = next(
+                (size for price, size in bids if abs(price - next_price) < 1e-9),
+                0.0,
+            )
+
             cumulative_size += price_size
             next_prices_info.append({
                 "position": i + 1,

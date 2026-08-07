@@ -1,10 +1,12 @@
 """
 市场数据管理模块
 """
+import time
 from typing import List, Dict, Any, Optional
 from api_client import PolymarketAPIClient
 from config import config
 from logger import setup_logger
+from market_making_strategy import normalize_orderbook
 
 logger = setup_logger("market_manager")
 
@@ -22,6 +24,9 @@ class MarketManager:
         self.api_client = api_client
         self.markets: List[Dict[str, Any]] = []
         self.selected_markets: List[Dict[str, Any]] = []
+        # 上一轮选择的市场 ID（用于差量重扫，不通过活跃订单集合推断）
+        self.previous_selected_market_ids: set = set()
+        self._monotonic = time.monotonic
     
     def scan_rewards_markets(self) -> List[Dict[str, Any]]:
         """
@@ -351,7 +356,7 @@ class MarketManager:
             market_spread = None
             tokens = market.get("tokens", [])
             
-            # 对每个 token 计算价差，取平均值
+            # 对每个 token 计算价差，取最差值（任一 token 不合格即拒绝整个市场）
             spreads = []
             for token in tokens:
                 token_id = token.get("token_id")
@@ -367,24 +372,22 @@ class MarketManager:
                 if mid_price is None:
                     continue
                 
-                # 从订单簿获取 best_bid 和 best_ask
-                bids = orderbook.get("bids", [])
-                asks = orderbook.get("asks", [])
-                
-                if not bids or not asks:
+                normalized = normalize_orderbook(orderbook)
+
+                if normalized.is_empty or normalized.is_one_sided or normalized.is_crossed:
                     continue
                 
-                best_bid = float(bids[-1].get("price", 0))  # 最高买价
-                best_ask = float(asks[-1].get("price", 0))  # 最低卖价
+                best_bid = normalized.best_bid
+                best_ask = normalized.best_ask
                 
-                if best_bid > 0 and best_ask > 0:
+                if best_bid is not None and best_ask is not None and best_bid > 0 and best_ask > 0:
                     # 计算价差 = (best_ask - best_bid) / mid_price
                     spread = best_ask - best_bid
                     spreads.append(spread)
             
-            # 如果有计算出的价差，使用平均值；否则使用 API 返回的 spread
+            # 如果有计算出的价差，使用最差值；否则使用 API 返回的 spread
             if spreads:
-                market_spread = sum(spreads) / len(spreads)
+                market_spread = max(spreads)
             else:
                 # 回退到 API 数据
                 market_spread = float(market.get("spread", 0))
@@ -668,6 +671,16 @@ class MarketManager:
         
         if not tokens or not rewards_max_spread:
             return False, "市场缺少 tokens 或 rewards_max_spread", {}
+
+        # 完整市场准入（最差边点差 + 数据新鲜度 + 退出能力模拟）
+        entry = strategy.evaluate_market_entry(
+            market,
+            orderbooks_dict,
+            now_monotonic=self._monotonic(),
+        )
+        if not entry.accepted:
+            failure_reasons = {entry.reason: 1}
+            return False, f"市场准入拒绝: {entry.reason}", failure_reasons
         
         # 统计各种失败原因
         failure_reasons = {}  # {reason: count}
@@ -795,6 +808,15 @@ class MarketManager:
             筛选后的市场列表
         """
         return self.selected_markets
+
+    def get_selected_market_ids(self) -> set:
+        """当前选择的市场 ID 集合（独立记录，不依赖活跃订单）。"""
+        return {m.get("market_id") for m in self.selected_markets if m.get("market_id")}
+
+    def update_selected_market_ids(self) -> set:
+        """把当前选择记录为上一轮选择，并返回当前 ID 集合。"""
+        self.previous_selected_market_ids = self.get_selected_market_ids()
+        return self.previous_selected_market_ids
     
     def refresh_markets(self) -> List[Dict[str, Any]]:
         """

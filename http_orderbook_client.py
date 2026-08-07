@@ -4,6 +4,7 @@ HTTP 订单簿客户端
 通过 HTTP POST 请求批量获取 Polymarket 订单簿数据
 """
 import json
+import time
 from typing import List, Dict, Any, Optional
 import requests
 
@@ -79,6 +80,10 @@ class HTTPOrderbookClient:
             if not isinstance(orderbooks, list):
                 print(f"[HTTP订单簿] 警告：响应格式不是列表: {type(orderbooks)}")
                 return []
+
+            for orderbook in orderbooks:
+                if isinstance(orderbook, dict) and "_received_at" not in orderbook:
+                    orderbook["_received_at"] = time.monotonic()
             
             return orderbooks
             
