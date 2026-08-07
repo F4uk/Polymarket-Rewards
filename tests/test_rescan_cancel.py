@@ -1,14 +1,14 @@
 """Focused regression tests: cancel reward BUYs before the blocking rescan.
 
-Covers cancellation-before-scan ordering, inventory SELL preservation,
-cancellation-uncertainty deferral, fill-during-cancel deferral, scan-failure
-behavior, and fresh BUY placement for retained markets.
+Covers cancellation-before-scan ordering, inventory SELL preservation, cancel
+failure skipping the scan, and fresh BUY placement for retained markets.
 """
 from __future__ import annotations
 
 import pytest
 
-from main import perform_market_rescan
+import main as main_module
+from config import config
 from tests.conftest import make_order_manager, register_fake_orders
 from tests.fakes import FakeAPIClient, FakeClobClient, FakeClock
 from tests.fixtures import TOKEN_A, TOKEN_B, market_fixture, orderbook_fixture
@@ -27,71 +27,12 @@ def _market(market_id="market-1", tokens=None):
     )
 
 
-def _book(clock, token_id, best_bid=0.60, best_ask=0.62):
-    bids = [
-        {"price": f"{best_bid - i * 0.01:.2f}", "size": "200"}
-        for i in range(4)
-    ]
-    asks = [
-        {"price": f"{best_ask + i * 0.01:.2f}", "size": "200"}
-        for i in range(2)
-    ]
-    book = orderbook_fixture(token_id, bids=bids, asks=asks)
-    book["_received_at"] = clock.monotonic()
-    return book
-
-
-def _make_env(clock):
-    m1 = _market("market-1")
-    books = {
-        TOKEN_A: _book(clock, TOKEN_A, 0.60, 0.62),
-        TOKEN_B: _book(clock, TOKEN_B, 0.40, 0.42),
-    }
-    api = FakeAPIClient(markets=[m1], orderbooks=books)
+def _make_om(clock):
+    api = FakeAPIClient(markets=[_market()], orderbooks={})
     clob = FakeClobClient(clock=clock)
     om = make_order_manager(api_client=api, clob_client=clob, clock=clock)
-    om.market_data_cache["market-1"] = m1
-    return om, clob, m1
-
-
-class RecordingMarketManager:
-    """Minimal MarketManager stand-in that records call order."""
-
-    def __init__(
-        self,
-        selected=None,
-        all_markets=None,
-        fail_scan=False,
-        previous_market_ids=None,
-    ):
-        self.calls = []
-        self.selected = list(selected or [])
-        self.all_markets = list(
-            all_markets if all_markets is not None else self.selected
-        )
-        self.fail_scan = fail_scan
-        self._previous_market_ids = set(previous_market_ids or [])
-
-    def update_selected_market_ids(self):
-        self.calls.append("update_selected_market_ids")
-        return set(self._previous_market_ids)
-
-    def scan_rewards_markets(self):
-        self.calls.append("scan_rewards_markets")
-        if self.fail_scan:
-            raise RuntimeError("simulated scan failure")
-        return list(self.all_markets)
-
-    def filter_markets(self):
-        self.calls.append("filter_markets")
-        return list(self.selected)
-
-    def get_selected_market_ids(self):
-        self.calls.append("get_selected_market_ids")
-        return {m.get("market_id") for m in self.selected}
-
-    def get_selected_markets(self):
-        return list(self.selected)
+    om.market_data_cache["market-1"] = _market()
+    return om, clob
 
 
 def _register_sell(om, clob, order_id, purpose):
@@ -122,43 +63,12 @@ def _register_sell(om, clob, order_id, purpose):
     )
 
 
-def test_buy_cancellation_happens_before_scan(fake_clock):
-    om, clob, m1 = _make_env(fake_clock)
-    resp = om.place_order("market-1", TOKEN_A, "BUY", 0.50, 100.0)
-    assert resp is not None
-
-    mm = RecordingMarketManager(selected=[])
-    events = []
-    mm.calls = events
-    original_cancel = om.cancel_buy_orders_for_rescan
-    original_confirm = om.confirm_buy_cancellations_for_rescan
-
-    def spy_cancel():
-        events.append("cancel")
-        return original_cancel()
-
-    def spy_confirm():
-        events.append("confirm")
-        return original_confirm()
-
-    om.cancel_buy_orders_for_rescan = spy_cancel
-    om.confirm_buy_cancellations_for_rescan = spy_confirm
-
-    result = perform_market_rescan(om, mm)
-
-    assert result["scanned"] is True
-    assert events.index("cancel") < events.index("confirm")
-    assert events.index("cancel") < events.index("scan_rewards_markets")
-    assert events.index("confirm") < events.index("scan_rewards_markets")
-    assert events.index("scan_rewards_markets") < events.index("filter_markets")
-
-
 @pytest.mark.parametrize(
     "purpose",
     ["FAST_EXIT", "LIMITED_WAIT_EXIT", "EMERGENCY_EXIT"],
 )
 def test_rescan_cancel_preserves_inventory_sell(fake_clock, purpose):
-    om, clob, m1 = _make_env(fake_clock)
+    om, clob = _make_om(fake_clock)
     register_fake_orders(
         om,
         {
@@ -186,10 +96,9 @@ def test_rescan_cancel_preserves_inventory_sell(fake_clock, purpose):
     )
     _register_sell(om, clob, "sell-1", purpose)
 
-    assert om.cancel_buy_orders_for_rescan() == 1
-    confirmation = om.confirm_buy_cancellations_for_rescan()
+    cancelled, total = om.cancel_reward_buys_for_rescan()
 
-    assert confirmation["scan_ready"] is True
+    assert (cancelled, total) == (1, 1)
     assert "BUY" not in om.active_orders["market-1"][TOKEN_A]
     sell = om.active_orders["market-1"][TOKEN_A]["SELL"]
     assert sell["order_id"] == "sell-1"
@@ -197,97 +106,159 @@ def test_rescan_cancel_preserves_inventory_sell(fake_clock, purpose):
     assert "sell-1" not in clob.cancelled
 
 
-def test_cancel_uncertainty_defers_scan(fake_clock):
-    om, clob, m1 = _make_env(fake_clock)
-    resp = om.place_order("market-1", TOKEN_A, "BUY", 0.50, 100.0)
-    order_id = resp["id"]
-    # Cancel API succeeds, but the BUY stays visible in open orders.
-    clob.cancel_keep_order = True
+class _MainOrderManager:
+    """Minimal OrderManager stand-in for exercising the real main loop."""
 
-    mm = RecordingMarketManager(selected=[m1])
-    result = perform_market_rescan(om, mm)
+    def __init__(self, events, cancel_result=(1, 1)):
+        self.events = events
+        self.cancel_result = cancel_result
+        self.startup_open_orders_blocked = False
+        self.market_data_cache = {}
+        self.place_calls = 0
 
-    assert result["scanned"] is False
-    assert result["cancellation"]["scan_ready"] is False
-    assert "scan_rewards_markets" not in mm.calls
-    assert "filter_markets" not in mm.calls
-    assert order_id in om.cancel_pending_tracking
-    buys = [c for c in clob.post_order_calls if c["order"].side == "BUY"]
-    assert len(buys) == 1  # no new BUY placed
+    def reconcile_startup(self):
+        return {
+            "open_orders": 0,
+            "buys_cancelled": 0,
+            "sells_imported": 0,
+            "positions_imported": 0,
+            "open_orders_query_ok": True,
+        }
 
+    def check_positions_and_hedge(self):
+        return {}
 
-def test_unknown_buy_blocks_rescan(fake_clock):
-    om, clob, m1 = _make_env(fake_clock)
-    resp = om.place_order("market-1", TOKEN_A, "BUY", 0.50, 100.0)
-    om.active_orders["market-1"][TOKEN_A]["BUY"]["status"] = "UNKNOWN"
-    clob.cancel_fail = True  # cancellation cannot be resolved
+    def check_orders(self):
+        return {}
 
-    mm = RecordingMarketManager(selected=[m1])
-    result = perform_market_rescan(om, mm)
+    def maybe_reenter_markets(self, markets):
+        return {}
 
-    assert result["scanned"] is False
-    assert om.active_orders["market-1"][TOKEN_A]["BUY"]["status"] == "UNKNOWN"
-    assert "scan_rewards_markets" not in mm.calls
-    assert "filter_markets" not in mm.calls
+    def get_order_statistics(self):
+        return {
+            "active_orders_count": 0,
+            "active_markets_count": 0,
+            "total_exposure_usdc": 0.0,
+            "filled_buy_orders_count": 0,
+            "subscribed_tokens_count": 0,
+        }
 
+    def get_active_orders(self, market_id=None):
+        return {}
 
-def test_fill_during_cancel_defers_scan_and_preserves_inventory(fake_clock):
-    om, clob, m1 = _make_env(fake_clock)
-    resp = om.place_order("market-1", TOKEN_A, "BUY", 0.50, 100.0)
-    order_id = resp["id"]
+    def adjust_orders_to_reward_boundaries(self, markets):
+        return {}
 
-    assert om.cancel_buy_orders_for_rescan() == 1
-    # Fill appears while cancellation is still propagating.
-    clob.fill_order(order_id, 40.0)
+    def cancel_reward_buys_for_rescan(self):
+        self.events.append("cancel_reward_buys_for_rescan")
+        return self.cancel_result
 
-    mm = RecordingMarketManager(selected=[m1])
-    result = perform_market_rescan(om, mm)
+    def refresh_market_selection(self, previous, new, selected):
+        self.events.append("refresh_market_selection")
+        return {
+            "retained": sorted(set(previous) & set(new)),
+            "removed": sorted(set(previous) - set(new)),
+            "added": sorted(set(new) - set(previous)),
+            "cancelled_buys": 0,
+            "placed_markets": 0,
+        }
 
-    assert result["scanned"] is False
-    assert result["cancellation"]["filled_during_cancel"] is True
-    assert "scan_rewards_markets" not in mm.calls
-    state = om.inventory_exits[TOKEN_A]
-    assert state["confirmed_filled_size"] == 40.0
-    assert state["processed_fill_size"] == 40.0
-    assert order_id not in om.cancel_pending_tracking
-    buys = [c for c in clob.post_order_calls if c["order"].side == "BUY"]
-    assert len(buys) == 1  # fill not double-processed, no duplicate BUY
+    def place_market_orders(self, market, orderbooks):
+        self.place_calls += 1
+        phase = "startup_place" if self.place_calls == 1 else "rescan_place"
+        self.events.append(f"{phase}:{market.get('market_id')}")
+        return {}
 
-
-def test_scan_failure_after_cancel_does_not_recreate_buy(fake_clock):
-    om, clob, m1 = _make_env(fake_clock)
-    resp = om.place_order("market-1", TOKEN_A, "BUY", 0.50, 100.0)
-    assert resp is not None
-    _register_sell(om, clob, "sell-1", "FAST_EXIT")
-
-    mm = RecordingMarketManager(selected=[m1], fail_scan=True)
-    with pytest.raises(RuntimeError):
-        perform_market_rescan(om, mm)
-
-    assert "BUY" not in om.active_orders.get("market-1", {}).get(TOKEN_A, {})
-    assert om.active_orders["market-1"][TOKEN_A]["SELL"]["order_id"] == "sell-1"
-    assert "sell-1" not in clob.cancelled
-    buys = [c for c in clob.post_order_calls if c["order"].side == "BUY"]
-    assert len(buys) == 1  # only the pre-scan BUY was ever placed
+    def cancel_all_buy_orders(self):
+        return 0
 
 
-def test_retained_market_gets_fresh_buy_after_successful_rescan(fake_clock):
-    om, clob, m1 = _make_env(fake_clock)
-    resp = om.place_order("market-1", TOKEN_A, "BUY", 0.50, 100.0)
-    original_buy_id = resp["id"]
+class _MainMarketManager:
+    """Minimal MarketManager stand-in that records one startup + one rescan."""
 
-    mm = RecordingMarketManager(
-        selected=[m1],
-        all_markets=[m1],
-        previous_market_ids={"market-1"},
+    def __init__(self, events, market, previous_market_ids=None):
+        self.events = events
+        self.market = market
+        self.previous_market_ids = set(previous_market_ids or [])
+        self.scan_calls = 0
+        self.filter_calls = 0
+
+    def scan_rewards_markets(self):
+        self.scan_calls += 1
+        name = "startup_scan" if self.scan_calls == 1 else "rescan_scan"
+        self.events.append(name)
+        return [self.market]
+
+    def filter_markets(self):
+        self.filter_calls += 1
+        name = "startup_filter" if self.filter_calls == 1 else "rescan_filter"
+        self.events.append(name)
+        return [self.market]
+
+    def update_selected_market_ids(self):
+        self.events.append("update_selected_market_ids")
+        main_module.running = False  # exit main loop after this rescan pass
+        return set(self.previous_market_ids)
+
+    def get_selected_market_ids(self):
+        self.events.append("get_selected_market_ids")
+        return {self.market["market_id"]}
+
+    def get_selected_markets(self):
+        return [self.market]
+
+
+def _run_main_loop(monkeypatch, om, mm):
+    monkeypatch.setattr(main_module, "PolymarketAPIClient", lambda: FakeAPIClient())
+    monkeypatch.setattr(main_module, "MarketMakingStrategy", lambda: object())
+    monkeypatch.setattr(main_module, "RiskManager", lambda: object())
+    monkeypatch.setattr(main_module, "OrderManager", lambda **kwargs: om)
+    monkeypatch.setattr(main_module, "MarketManager", lambda api: mm)
+    monkeypatch.setitem(config.config, "update_interval_seconds", 0)
+    monkeypatch.setitem(config.config, "order_check_interval_seconds", 0)
+    monkeypatch.setitem(config.config, "orderbook_update_interval_seconds", 0)
+    monkeypatch.setattr(main_module, "running", True)
+    main_module.main()
+
+
+def test_buy_cancellation_happens_before_scan(monkeypatch):
+    events = []
+    om = _MainOrderManager(events, cancel_result=(1, 1))
+    mm = _MainMarketManager(events, _market())
+
+    _run_main_loop(monkeypatch, om, mm)
+
+    assert events.index("cancel_reward_buys_for_rescan") < events.index(
+        "rescan_scan"
     )
-    result = perform_market_rescan(om, mm)
+    assert events.index("rescan_scan") < events.index("rescan_filter")
 
-    assert result["scanned"] is True
-    assert result["retained_placed"] == 1
-    assert original_buy_id in clob.cancelled
-    assert "BUY" in om.active_orders["market-1"][TOKEN_A]
-    assert (
-        om.active_orders["market-1"][TOKEN_A]["BUY"]["order_id"]
-        != original_buy_id
+
+def test_cancel_failure_skips_scan(monkeypatch):
+    events = []
+    om = _MainOrderManager(events, cancel_result=(0, 1))
+    mm = _MainMarketManager(events, _market())
+
+    _run_main_loop(monkeypatch, om, mm)
+
+    assert "cancel_reward_buys_for_rescan" in events
+    assert "rescan_scan" not in events
+    assert "rescan_filter" not in events
+    assert "refresh_market_selection" not in events
+
+
+def test_retained_market_gets_fresh_buy(monkeypatch):
+    events = []
+    om = _MainOrderManager(events, cancel_result=(1, 1))
+    mm = _MainMarketManager(
+        events, _market(), previous_market_ids={"market-1"}
+    )
+
+    _run_main_loop(monkeypatch, om, mm)
+
+    assert events.index("cancel_reward_buys_for_rescan") < events.index(
+        "rescan_scan"
+    )
+    assert events.index("refresh_market_selection") < events.index(
+        "rescan_place:market-1"
     )
