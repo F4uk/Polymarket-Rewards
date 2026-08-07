@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 
 from market_manager import MarketManager
+from market_making_strategy import MarketMakingStrategy
 from reward_calculator import calculate_q_one_q_two, estimate_our_score
 from tests.fakes import FakeAPIClient
 from tests.fixtures import TOKEN_A, TOKEN_B, market_fixture, orderbook_fixture
@@ -35,7 +36,12 @@ def test_reward_ratio_uses_total_daily_rate_and_config_sum_fallback(monkeypatch)
     monkeypatch.setattr(
         rc, "estimate_competitor_total_score", lambda *a, **k: (0.0, 0.0)
     )
-    monkeypatch.setattr(rc, "estimate_our_score", lambda *a, **k: 1.0)
+    monkeypatch.setattr(rc, "estimate_our_planned_buy_score", lambda *a, **k: 1.0)
+    monkeypatch.setattr(
+        MarketMakingStrategy,
+        "calculate_order_size",
+        lambda self, market, multiplier=None: float(market.get("rewards_min_size", 0)),
+    )
 
     manager = MarketManager(FakeAPIClient())
     orderbooks = _reward_orderbooks()
@@ -80,3 +86,41 @@ def test_complement_token_scoring_uses_complement_midpoint():
         orderbook_m_prime={"bids": [], "asks": []}, **common
     )
     assert score_with > score_without
+
+
+def test_zero_own_score_returns_zero_when_competitor_is_zero(monkeypatch):
+    import reward_calculator as rc
+
+    monkeypatch.setattr(
+        rc, "estimate_competitor_total_score", lambda *a, **k: (0.0, 0.0)
+    )
+    monkeypatch.setattr(rc, "estimate_our_planned_buy_score", lambda *a, **k: 0.0)
+    monkeypatch.setattr(
+        MarketMakingStrategy,
+        "calculate_order_size",
+        lambda self, market, multiplier=None: float(market.get("rewards_min_size", 0)),
+    )
+
+    manager = MarketManager(FakeAPIClient())
+    assert manager.calculate_reward_ratio(
+        _reward_market(total_daily_rate=3.0), _reward_orderbooks()
+    ) == 0.0
+
+
+def test_positive_own_score_with_zero_competitor_keeps_full_share(monkeypatch):
+    import reward_calculator as rc
+
+    monkeypatch.setattr(
+        rc, "estimate_competitor_total_score", lambda *a, **k: (0.0, 0.0)
+    )
+    monkeypatch.setattr(rc, "estimate_our_planned_buy_score", lambda *a, **k: 1.0)
+    monkeypatch.setattr(
+        MarketMakingStrategy,
+        "calculate_order_size",
+        lambda self, market, multiplier=None: float(market.get("rewards_min_size", 0)),
+    )
+
+    manager = MarketManager(FakeAPIClient())
+    assert manager.calculate_reward_ratio(
+        _reward_market(total_daily_rate=3.0), _reward_orderbooks()
+    ) == pytest.approx(3.0 / 10.0)

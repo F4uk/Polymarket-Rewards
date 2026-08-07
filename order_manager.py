@@ -167,7 +167,7 @@ class OrderManager:
         market = self.market_data_cache.get(market_id)
         tick_size = self.strategy.get_order_price_min_tick_size(market)
         tick_str = f"{tick_size:.4f}".rstrip("0").rstrip(".")
-        if tick_str not in ("0.1", "0.01", "0.001", "0.0001"):
+        if tick_str not in ("0.1", "0.01", "0.005", "0.0025", "0.001", "0.0001"):
             tick_str = "0.01"
 
         neg_risk = None
@@ -1591,7 +1591,9 @@ class OrderManager:
             total_competition = competition_buy + competition_sell
             
             # 计算实际挂单价格（买二价或奖励下边界）
-            actual_buy_price = self.strategy.calculate_actual_buy_price(orderbook, buy_price)
+            actual_buy_price = self.strategy.calculate_actual_buy_price(
+                orderbook, buy_price, market=market
+            )
             
             # 如果没有实际挂单价格（订单簿只有买一价），跳过挂单
             if actual_buy_price is None:
@@ -1664,7 +1666,7 @@ class OrderManager:
                 # 显示保护份额信息
                 if safety_info.get('total_protection_size') is not None:
                     logger.info(
-                        f"      买一价和买二价总份额: {safety_info['total_protection_size']:.2f}, "
+                        f"      严格 ahead 保护份额: {safety_info['total_protection_size']:.2f}, "
                         f"最小保护份额要求: {safety_info.get('min_protection_size', 0):.2f}"
                     )
             
@@ -3036,15 +3038,18 @@ class OrderManager:
         if not orderbook:
             logger.warning(f"无法获取订单簿数据，跳过补单")
             return None
-        
+
+        # 获取市场数据：提供权威 tick 上下文，并用于计算订单份额
+        market = self.market_data_cache.get(market_id)
+
         # 计算新的订单价格（奖励区间边界）
-        prices = self.strategy.calculate_order_prices(orderbook, rewards_max_spread)
+        prices = self.strategy.calculate_order_prices(
+            orderbook, rewards_max_spread, market=market
+        )
         if not prices:
             logger.warning(f"无法计算新订单价格，跳过补单")
             return None
-        
-        # 获取市场数据以计算订单份额（基于市场最小奖励份额的倍数）
-        market = self.market_data_cache.get(market_id)
+
         if market:
             order_size = self.strategy.calculate_order_size(market)
         else:
@@ -3059,7 +3064,9 @@ class OrderManager:
             # 如果是买单，检查是否可以安全挂单（风险管理）
             if buy_price and sell_price:
                 # 计算实际挂单价格（买二价或奖励下边界）
-                actual_buy_price = self.strategy.calculate_actual_buy_price(orderbook, buy_price)
+                actual_buy_price = self.strategy.calculate_actual_buy_price(
+                    orderbook, buy_price, market=market
+                )
                 
                 # 如果没有实际挂单价格（订单簿只有买一价），跳过
                 if actual_buy_price is None:
@@ -3095,7 +3102,6 @@ class OrderManager:
         # 规范化价格（确保符合 Polymarket 规范）
         # 买单向下取整，卖单向上取整（由 place_order 统一处理）
         if side == "SELL":
-            market = self.market_data_cache.get(market_id)
             price = self.strategy.normalize_price(
                 price,
                 self.strategy.get_order_price_min_tick_size(market)
@@ -3791,7 +3797,7 @@ class OrderManager:
                 if not prices:
                     continue
                 actual = self.strategy.calculate_actual_buy_price(
-                    orderbook, prices["buy_price"]
+                    orderbook, prices["buy_price"], market=market
                 )
                 if actual is None:
                     continue
@@ -3953,8 +3959,11 @@ class OrderManager:
                     # 如果没有数据，跳过（不操作）
                     continue
                 
-                # 计算新的奖励区间边界价格
-                prices = self.strategy.calculate_order_prices(orderbook, rewards_max_spread)
+                # 计算新的奖励区间边界价格（使用市场权威 tick）
+                market = self.market_data_cache.get(market_id, {})
+                prices = self.strategy.calculate_order_prices(
+                    orderbook, rewards_max_spread, market=market
+                )
                 if not prices:
                     continue
                 
@@ -4058,7 +4067,7 @@ class OrderManager:
                     actual_buy_price_for_check = None
                     if side == "BUY" and buy_price_boundary and sell_price_boundary:
                         actual_buy_price_for_check = self.strategy.calculate_actual_buy_price(
-                            orderbook, buy_price_boundary
+                            orderbook, buy_price_boundary, market=market
                         )
                         if actual_buy_price_for_check is not None:
                             can_stay, safety_info = self.strategy.can_place_buy_order_safely(
@@ -4073,10 +4082,12 @@ class OrderManager:
 
                     # 当前订单位置是否仍有足够保护深度
                     protection_size = 0.0
-                    if normalized_book.normalized_bids:
-                        protection_size = normalized_book.normalized_bids[0][1]
-                        if len(normalized_book.normalized_bids) >= 2:
-                            protection_size += normalized_book.normalized_bids[1][1]
+                    if side == "BUY":
+                        protection_size = sum(
+                            float(size)
+                            for bid_price, size in normalized_book.normalized_bids
+                            if bid_price > float(current_price) + 1e-9
+                        )
                     protection_ok = (
                         protection_size
                         >= current_size * config.min_protection_size_multiplier
@@ -4328,8 +4339,11 @@ class OrderManager:
                                 order_size_for_check = 50  # 默认值
                         
                         if buy_price and sell_price:
+                            market = self.market_data_cache.get(market_id)
                             # 计算实际挂单价格（买二价或奖励下边界）
-                            actual_buy_price = self.strategy.calculate_actual_buy_price(current_orderbook, buy_price)
+                            actual_buy_price = self.strategy.calculate_actual_buy_price(
+                                current_orderbook, buy_price, market=market
+                            )
                             
                             # 如果没有实际挂单价格（订单簿只有买一价），跳过重新挂单
                             if actual_buy_price is None:
@@ -4548,7 +4562,9 @@ class OrderManager:
                         
                         if buy_price and sell_price:
                             # 计算实际挂单价格（买二价或奖励下边界）
-                            actual_buy_price = self.strategy.calculate_actual_buy_price(current_orderbook, buy_price)
+                            actual_buy_price = self.strategy.calculate_actual_buy_price(
+                                current_orderbook, buy_price, market=market
+                            )
                             
                             # 如果没有实际挂单价格（订单簿只有买一价），更新 last_attempt_time，继续保留在列表中
                             if actual_buy_price is None:
