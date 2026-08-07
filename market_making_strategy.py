@@ -305,7 +305,14 @@ class MarketMakingStrategy:
         tick_size = 0.01
         if order_price_min_tick_size is not None:
             tick_size = float(order_price_min_tick_size)
-        if tick_size <= 0 or tick_size not in (0.1, 0.01, 0.001, 0.0001):
+        if tick_size <= 0 or tick_size not in (
+            0.1,
+            0.01,
+            0.005,
+            0.0025,
+            0.001,
+            0.0001,
+        ):
             tick_size = 0.01
 
         tick = Decimal(str(tick_size))
@@ -578,7 +585,9 @@ class MarketMakingStrategy:
         if not prices:
             return EntryDecision(False, ENTRY_INVALID_BOOK, token_id, details)
 
-        actual_buy_price = self.calculate_actual_buy_price(orderbook, prices["buy_price"])
+        actual_buy_price = self.calculate_actual_buy_price(
+            orderbook, prices["buy_price"], market=market
+        )
         details["actual_buy_price"] = actual_buy_price
         if actual_buy_price is None:
             return EntryDecision(False, ENTRY_NO_SECOND_BID, token_id, details)
@@ -784,7 +793,8 @@ class MarketMakingStrategy:
     def calculate_actual_buy_price(
         self,
         orderbook: Dict[str, Any],
-        buy_price: float
+        buy_price: float,
+        market: Optional[Dict[str, Any]] = None,
     ) -> Optional[float]:
         """
         根据订单簿和奖励下边界计算实际挂单价格
@@ -821,7 +831,10 @@ class MarketMakingStrategy:
         
         # 如果买二价 < buy_price（奖励下边界），返回 buy_price（奖励下边界）
         # 因为使用奖励下边界挂单后，买二价在我们后面，我们就是买二价
-        tick_size = self.infer_tick_size_from_orderbook(orderbook)
+        if market is not None:
+            tick_size = self.get_order_price_min_tick_size(market)
+        else:
+            tick_size = self.infer_tick_size_from_orderbook(orderbook)
         return self.round_price_to_tick(buy_price, tick_size, "BUY")
     
     def can_place_buy_order_safely(
@@ -985,18 +998,25 @@ class MarketMakingStrategy:
                 info["price_cliff_reason"] = f"后{i+1}价 ({next_price:.4f}) 与我们挂单价 ({actual_buy_price:.4f}) 的差值 ({price_diff:.4f}) 超过阈值 ({price_cliff_threshold:.4f})，存在价格断层风险"
                 return False, {**info, "reason": info["price_cliff_reason"]}
         
-        # 3. 检查保护份额是否足够
-        # 计算买一价和买二价的总份额
-        total_protection_size = best_bid_size + second_bid_size
-        
+        # 3. 检查严格 ahead 保护份额是否足够：只统计价格严格高于我们
+        # 挂单价的流动性。同价/更低价格流动性不视为 ahead 保护，也不
+        # 声称等于交易所队列优先级（这是保守估计）。
+        strict_ahead_protection_size = sum(
+            float(size)
+            for bid_price, size in bids
+            if bid_price > actual_buy_price + 1e-9
+        )
+        total_protection_size = strict_ahead_protection_size
+        info["strict_ahead_protection_size"] = strict_ahead_protection_size
+        info["total_protection_size"] = total_protection_size
+
         if total_protection_size < min_protection_size:
             info["price_cliff_detected"] = True
-            info["price_cliff_reason"] = f"买一价和买二价的总份额 ({total_protection_size:.2f}) 小于最小保护份额要求 ({min_protection_size:.2f})，容易被吃掉"
+            info["price_cliff_reason"] = f"严格 ahead 保护份额 ({total_protection_size:.2f}) 小于最小保护份额要求 ({min_protection_size:.2f})，容易被吃掉"
             return False, {**info, "reason": info["price_cliff_reason"]}
         
         # 如果通过所有检查
         info["next_prices"] = next_prices_info
-        info["total_protection_size"] = total_protection_size
         info["min_protection_size"] = min_protection_size
         position_desc = "买二价" if is_second_bid_price else f"买{our_position_after_place}价"
         return True, {**info, "reason": f"挂单后将成为{position_desc}，且未检测到价格断层，安全"}

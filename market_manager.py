@@ -71,10 +71,10 @@ class MarketManager:
             收益比值，如果无法计算则返回 0
         """
         from reward_calculator import (
-            calculate_q_one_q_two,
             calculate_q_min,
-            estimate_our_score,
-            estimate_competitor_total_score
+            calculate_size_cutoff_adjusted_midpoint,
+            estimate_competitor_total_score,
+            estimate_our_planned_buy_score,
         )
         from market_making_strategy import MarketMakingStrategy
         
@@ -140,39 +140,69 @@ class MarketManager:
             logger.debug(f"市场 {market.get('market_id')} token {token_id_m[:20]}... 订单簿为空")
             return 0.0
         
-        # 计算中间价（使用第一个 token 的订单簿）
+        # 计算奖励调整后中间价（每个 token 使用自己的订单簿）
         strategy = MarketMakingStrategy()
-        mid_price = strategy.calculate_mid_price(orderbook_m)
-        if mid_price is None:
-            logger.debug(f"市场 {market.get('market_id')} 无法计算中间价")
-            return 0.0
-        
-        # 计算奖励区间边界（用于确定我们的挂单位置）
-        buy_price, sell_price = strategy.calculate_reward_range(
-            mid_price, rewards_max_spread, market=market
+        mid_price = calculate_size_cutoff_adjusted_midpoint(
+            orderbook_m, rewards_min_size
         )
-        
-        # 计算实际挂单价格（买二价或奖励下边界）
-        actual_buy_price = strategy.calculate_actual_buy_price(orderbook_m, buy_price)
-        if actual_buy_price is None:
-            # 如果订单簿只有买一价，无法挂买二价，返回0
-            logger.debug(f"市场 {market.get('market_id')} 订单簿只有买一价，无法挂买二价")
+        if mid_price is None:
+            logger.debug(f"市场 {market.get('market_id')} 无法计算奖励调整后中间价")
             return 0.0
-        
+        mid_price_m_prime = None
+        if orderbook_m_prime:
+            mid_price_m_prime = calculate_size_cutoff_adjusted_midpoint(
+                orderbook_m_prime, rewards_min_size
+            )
+
         # 参数设置
         v = float(rewards_max_spread)  # max spread (in cents)
         b = 1.0  # in-game multiplier (默认值)
         c = 3.0  # scaling factor (固定值)
-        our_size = float(rewards_min_size)
-        
-        # 估算竞争者的总评分（基于订单簿中的所有订单）
+        our_size = float(strategy.calculate_order_size(market))
+
+        # 实际计划 REWARD_BUY；被 Execution Policy 拒绝的一侧按不存在处理。
+        def planned_buy_price(orderbook):
+            if not orderbook:
+                return None
+            prices = strategy.calculate_order_prices(
+                orderbook, rewards_max_spread, market=market
+            )
+            if not prices:
+                return None
+            actual = strategy.calculate_actual_buy_price(
+                orderbook, prices["buy_price"], market=market
+            )
+            if actual is None:
+                return None
+            can_place, safety_info = strategy.can_place_buy_order_safely(
+                orderbook,
+                prices["buy_price"],
+                prices["sell_price"],
+                our_size,
+                actual,
+            )
+            if not can_place:
+                logger.debug(
+                    f"市场 {market.get('market_id')} 的 BUY 被执行策略拒绝: "
+                    f"{safety_info.get('reason')}"
+                )
+                return None
+            return actual
+
+        actual_buy_price_m = planned_buy_price(orderbook_m)
+        actual_buy_price_m_prime = planned_buy_price(orderbook_m_prime)
+
+        # 估算竞争者的总评分（相对 L2 启发式，非逐 maker 精确值）
         competitor_q_one, competitor_q_two = estimate_competitor_total_score(
             orderbook_m,
             orderbook_m_prime,
             mid_price,
             v,
             b,
-            rewards_max_spread
+            rewards_max_spread,
+            adjusted_mid_m=mid_price,
+            adjusted_mid_m_prime=mid_price_m_prime,
+            rewards_min_size=rewards_min_size,
         )
         
         # 计算竞争者的 Q_min
@@ -183,18 +213,16 @@ class MarketManager:
             c
         )
         
-        # 计算我们的评分（基于实际挂单的位置和份额）
-        # 使用实际挂单价格（买二价或奖励下边界）而不是奖励区间边界
-        # 考虑两个互补 token 的订单（根据文档，Q_one 和 Q_two 是跨两个互补市场的）
-        our_q_min = estimate_our_score(
-            our_buy_price=actual_buy_price,  # 使用实际挂单价格（买二价或奖励下边界）
-            our_sell_price=sell_price,
+        # 计算我们的评分（只使用实际计划的 YES BUY + NO BUY）
+        our_q_min = estimate_our_planned_buy_score(
+            yes_buy_price=actual_buy_price_m,
+            no_buy_price=actual_buy_price_m_prime,
             our_size=our_size,
-            mid_price=mid_price,
+            mid_price_m=mid_price,
+            mid_price_m_prime=mid_price_m_prime,
             v=v,
             b=b,
-            rewards_max_spread=rewards_max_spread,
-            orderbook_m_prime=orderbook_m_prime
+            rewards_min_size=rewards_min_size,
         )
         
         # 计算我们的份额占比（Equation 5: Q_normal）
@@ -214,12 +242,12 @@ class MarketManager:
         
         logger.debug(
             f"奖励计算详情: 市场={market.get('market_id')}, "
-            f"中间价={mid_price:.4f}, "
+            f"奖励调整后中间价={mid_price:.4f}, "
             f"我们的Q_min={our_q_min:.2f}, "
             f"竞争者Q_min={competitor_q_min:.2f}, "
             f"我们的份额占比={our_share_ratio:.4f}, "
-            f"预期奖励={expected_reward:.4f}, "
-            f"收益比值={ratio:.6f}"
+            f"预期奖励(估计)={expected_reward:.4f}, "
+            f"收益比值(估计)={ratio:.6f}"
         )
         
         return ratio
@@ -768,7 +796,9 @@ class MarketManager:
             order_size = strategy.calculate_order_size(market)
             
             # 计算实际挂单价格（买二价或奖励下边界）
-            actual_buy_price = strategy.calculate_actual_buy_price(orderbook, buy_price)
+            actual_buy_price = strategy.calculate_actual_buy_price(
+                orderbook, buy_price, market=market
+            )
             
             # 如果没有实际挂单价格（订单簿只有买一价），跳过
             if actual_buy_price is None:

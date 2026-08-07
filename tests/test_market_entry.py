@@ -145,7 +145,7 @@ def test_exit_depth_exactly_enough(monkeypatch, fake_clock):
     _override(monkeypatch)
     strategy = MarketMakingStrategy()
     book_a = _fresh_book(fake_clock, TOKEN_A, bids=[
-        {"price": "0.60", "size": "60"},
+        {"price": "0.60", "size": "100"},
         {"price": "0.59", "size": "60"},
         {"price": "0.58", "size": "60"},
         {"price": "0.57", "size": "60"},
@@ -174,8 +174,8 @@ def test_exit_depth_slightly_insufficient(monkeypatch, fake_clock):
     _override(monkeypatch, min_protection_size_multiplier=0.8)
     strategy = MarketMakingStrategy()
     book_a = _fresh_book(fake_clock, TOKEN_A, bids=[
-        {"price": "0.60", "size": "45"},
-        {"price": "0.59", "size": "45"},
+        {"price": "0.60", "size": "80"},
+        {"price": "0.59", "size": "20"},
         {"price": "0.58", "size": "5"},
         {"price": "0.57", "size": "5"},
     ], asks=[
@@ -200,13 +200,17 @@ def test_exit_depth_slightly_insufficient(monkeypatch, fake_clock):
 
 
 def test_exit_vwap_too_lossy(monkeypatch, fake_clock):
-    _override(monkeypatch, exit_immediate_max_loss_bps=1.0)
+    _override(
+        monkeypatch,
+        exit_immediate_max_loss_bps=1.0,
+        min_exit_depth_multiplier=4.0,
+    )
     strategy = MarketMakingStrategy()
     book_a = _fresh_book(fake_clock, TOKEN_A, bids=[
-        {"price": "0.60", "size": "50"},
-        {"price": "0.59", "size": "50"},
-        {"price": "0.55", "size": "200"},
-        {"price": "0.54", "size": "200"},
+        {"price": "0.60", "size": "100"},
+        {"price": "0.59", "size": "1"},
+        {"price": "0.57", "size": "300"},
+        {"price": "0.56", "size": "300"},
     ], asks=[
         {"price": "0.62", "size": "200"},
     ])

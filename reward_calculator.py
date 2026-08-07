@@ -5,8 +5,7 @@ Polymarket 奖励计算模块
 """
 from typing import Dict, List, Optional, Tuple, Any
 from logger import setup_logger
-from market_making_strategy import reward_spread_decimal
-from config import config
+from market_making_strategy import normalize_orderbook
 
 logger = setup_logger("reward_calculator")
 
@@ -53,13 +52,53 @@ def calculate_spread_cents(order_price: float, mid_price: float) -> float:
     return spread
 
 
+def calculate_size_cutoff_adjusted_midpoint(
+    orderbook: Optional[Dict[str, Any]],
+    size_cutoff: float,
+) -> Optional[float]:
+    """Size-cutoff-adjusted reward midpoint (documented assumption).
+
+    Cumulative bid/ask size at-or-better must reach ``size_cutoff``; returns
+    ``None`` when either side is unavailable so missing liquidity is not
+    invented.
+    """
+    if not orderbook or size_cutoff is None or float(size_cutoff) <= 0:
+        return None
+
+    normalized = normalize_orderbook(orderbook)
+    cutoff = float(size_cutoff)
+
+    cumulative = 0.0
+    adjusted_bid = None
+    for price, size in normalized.normalized_bids:
+        cumulative += float(size)
+        if cumulative >= cutoff:
+            adjusted_bid = price
+            break
+
+    cumulative = 0.0
+    adjusted_ask = None
+    for price, size in normalized.normalized_asks:
+        cumulative += float(size)
+        if cumulative >= cutoff:
+            adjusted_ask = price
+            break
+
+    if adjusted_bid is None or adjusted_ask is None:
+        return None
+    return (adjusted_bid + adjusted_ask) / 2.0
+
+
 def calculate_q_one_q_two(
     orderbook_m: Dict[str, Any],
     orderbook_m_prime: Optional[Dict[str, Any]],
     mid_price: float,
     v: float,
     b: float,
-    rewards_max_spread: float
+    rewards_max_spread: float,
+    adjusted_mid_m: Optional[float] = None,
+    adjusted_mid_m_prime: Optional[float] = None,
+    rewards_min_size: Optional[float] = None,
 ) -> Tuple[float, float]:
     """
     Equation 2 & 3: 计算双边流动性分数
@@ -81,21 +120,28 @@ def calculate_q_one_q_two(
     q_one = 0.0
     q_two = 0.0
     
-    # 计算奖励区间边界（用于过滤订单）
-    # 奖励区间半宽：美分转小数，唯一缩进来自配置（tick 默认为 0.01，与
-    # MarketMakingStrategy.calculate_reward_range 保持一致；不再使用固定减一美分）
-    spread_decimal = reward_spread_decimal(
-        rewards_max_spread,
-        config.reward_boundary_inset_ticks,
-        0.01,
-    )
-    buy_price = max(0.0, mid_price - spread_decimal)
-    sell_price = min(1.0, mid_price + spread_decimal)
+    # Each token scores from its own adjusted midpoint when supplied; without
+    # strict mode, keep the legacy complement fallback.
+    mid_m = adjusted_mid_m if adjusted_mid_m is not None else mid_price
+    if adjusted_mid_m_prime is not None:
+        mid_m_prime = adjusted_mid_m_prime
+    elif rewards_min_size is None:
+        mid_m_prime = 1.0 - mid_m
+    else:
+        mid_m_prime = None
 
-    # m' 是互补 token，其中点必须使用 1 - mid_price
-    m_prime_mid_price = 1.0 - mid_price
-    m_prime_buy_price = max(0.0, m_prime_mid_price - spread_decimal)
-    m_prime_sell_price = min(1.0, m_prime_mid_price + spread_decimal)
+    # Competitor eligibility uses the full official rewardsMaxSpread range.
+    # Our configured execution inset must never shrink competitor eligibility.
+    spread_decimal = max(0.0, float(rewards_max_spread) / 100.0)
+    buy_price = max(0.0, mid_m - spread_decimal)
+    sell_price = min(1.0, mid_m + spread_decimal)
+
+    m_prime_mid_price = mid_m_prime
+    m_prime_buy_price = None
+    m_prime_sell_price = None
+    if m_prime_mid_price is not None:
+        m_prime_buy_price = max(0.0, m_prime_mid_price - spread_decimal)
+        m_prime_sell_price = min(1.0, m_prime_mid_price + spread_decimal)
     
     # 处理市场 m 的订单
     bids_m = orderbook_m.get("bids", [])
@@ -108,7 +154,7 @@ def calculate_q_one_q_two(
         
         # 只计算奖励区间范围内的订单
         if buy_price <= bid_price <= sell_price:
-            s = calculate_spread_cents(bid_price, mid_price)
+            s = calculate_spread_cents(bid_price, mid_m)
             if s <= v:  # 价差在允许范围内
                 score = calculate_order_score(v, s, b)
                 q_one += score * bid_size
@@ -120,13 +166,13 @@ def calculate_q_one_q_two(
         
         # 只计算奖励区间范围内的订单
         if buy_price <= ask_price <= sell_price:
-            s = calculate_spread_cents(ask_price, mid_price)
+            s = calculate_spread_cents(ask_price, mid_m)
             if s <= v:  # 价差在允许范围内
                 score = calculate_order_score(v, s, b)
                 q_two += score * ask_size
     
     # 处理市场 m' 的订单（互补市场）
-    if orderbook_m_prime:
+    if orderbook_m_prime and m_prime_mid_price is not None:
         bids_m_prime = orderbook_m_prime.get("bids", [])
         asks_m_prime = orderbook_m_prime.get("asks", [])
         
@@ -187,6 +233,39 @@ def calculate_q_min(q_one: float, q_two: float, mid_price: float, c: float = 3.0
         q_min = min(q_one, q_two)
     
     return q_min
+
+
+def estimate_our_planned_buy_score(
+    yes_buy_price: Optional[float],
+    no_buy_price: Optional[float],
+    our_size: float,
+    mid_price_m: float,
+    mid_price_m_prime: Optional[float],
+    v: float,
+    b: float,
+    rewards_min_size: Optional[float] = None,
+) -> float:
+    """Q_min from the actual planned YES/NO BUY orders only.
+
+    No synthetic SELL is modeled; below-min or unplanned sides score zero.
+    """
+    size = float(our_size)
+    if rewards_min_size is not None and size < float(rewards_min_size):
+        return 0.0
+
+    q_one = 0.0
+    if yes_buy_price is not None and mid_price_m is not None:
+        spread = calculate_spread_cents(yes_buy_price, mid_price_m)
+        if spread <= v:
+            q_one = calculate_order_score(v, spread, b) * size
+
+    q_two = 0.0
+    if no_buy_price is not None and mid_price_m_prime is not None:
+        spread = calculate_spread_cents(no_buy_price, mid_price_m_prime)
+        if spread <= v:
+            q_two = calculate_order_score(v, spread, b) * size
+
+    return calculate_q_min(q_one, q_two, mid_price_m)
 
 
 def estimate_our_score(
@@ -279,12 +358,15 @@ def estimate_competitor_total_score(
     mid_price: float,
     v: float,
     b: float,
-    rewards_max_spread: float
+    rewards_max_spread: float,
+    adjusted_mid_m: Optional[float] = None,
+    adjusted_mid_m_prime: Optional[float] = None,
+    rewards_min_size: Optional[float] = None,
 ) -> Tuple[float, float]:
     """
     估算所有竞争者的总评分
     
-    基于订单簿中奖励区间范围内的所有订单计算竞争者总评分
+    基于订单簿中奖励区间范围内的所有订单计算相对竞争者总评分（启发式）
     
     Args:
         orderbook_m: 市场 m 的订单簿
@@ -297,15 +379,17 @@ def estimate_competitor_total_score(
     Returns:
         (competitor_q_one, competitor_q_two) 元组
     """
-    # 直接使用 calculate_q_one_q_two 计算所有订单的总评分
-    # 这包括了订单簿中所有竞争者的订单
+    # 公开聚合 L2 无法还原逐 maker/逐单 min-size，因此这是相对启发式估计。
     competitor_q_one, competitor_q_two = calculate_q_one_q_two(
         orderbook_m,
         orderbook_m_prime,
         mid_price,
         v,
         b,
-        rewards_max_spread
+        rewards_max_spread,
+        adjusted_mid_m=adjusted_mid_m,
+        adjusted_mid_m_prime=adjusted_mid_m_prime,
+        rewards_min_size=rewards_min_size,
     )
     
     return competitor_q_one, competitor_q_two
