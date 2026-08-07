@@ -3577,8 +3577,12 @@ class OrderManager:
                     )
                     if not isinstance(cancel_response, dict):
                         raise ValueError("取消接口返回未知格式")
-                    canceled = cancel_response.get("canceled") or []
-                    not_canceled = cancel_response.get("not_canceled") or {}
+                    if "canceled" not in cancel_response:
+                        raise ValueError("取消接口缺少 canceled 字段")
+                    if "not_canceled" not in cancel_response:
+                        raise ValueError("取消接口缺少 not_canceled 字段")
+                    canceled = cancel_response["canceled"]
+                    not_canceled = cancel_response["not_canceled"]
                     if not isinstance(canceled, (list, tuple, set)):
                         raise ValueError("取消接口 canceled 字段格式异常")
                     if not isinstance(not_canceled, dict):

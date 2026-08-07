@@ -370,3 +370,33 @@ def test_legacy_buy_not_canceled_response_keeps_block(fake_clock):
     assert om.maybe_reenter_markets([_market()]) == {}
     assert len([c for c in clob.post_order_calls if c["order"].side == "BUY"]) == 0
     assert om.retry_startup_reconciliation() is False
+
+
+def test_legacy_buy_cancel_response_missing_field_keeps_block(fake_clock):
+    om, clob = _make_om(fake_clock)
+    om.get_positions = lambda **kwargs: []
+    clob.open_orders = [
+        {
+            "id": "buy-old",
+            "side": "BUY",
+            "token_id": TOKEN_A,
+            "price": 0.50,
+            "size": 100.0,
+            "filled": 0.0,
+            "remaining": 100.0,
+        }
+    ]
+    # 生产响应缺失 not_canceled 字段
+    clob.cancel_order = lambda payload: {"canceled": ["buy-old"]}
+
+    result = om.reconcile_startup()
+    assert result["buy_cancellations_ok"] is False
+    assert result["buy_cancel_failures"] == 1
+    assert result["buys_cancelled"] == 0
+    assert om.startup_open_orders_blocked is True
+
+    assert om.maybe_reenter_markets([_market()]) == {}
+    assert len([c for c in clob.post_order_calls if c["order"].side == "BUY"]) == 0
+
+    assert om.retry_startup_reconciliation() is False
+    assert om.startup_open_orders_blocked is True
