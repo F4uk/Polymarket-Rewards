@@ -79,11 +79,17 @@ class MarketManager:
         from market_making_strategy import MarketMakingStrategy
         
         rewards_config = market.get("rewards_config", [])
-        if not rewards_config:
-            return 0.0
-        
-        # 获取每日奖励率
-        rate_per_day = rewards_config[0].get("rate_per_day", 0)
+
+        # 获取每日奖励总额：优先使用根字段 total_daily_rate，
+        # 否则汇总所有 rewards_config 的 rate_per_day
+        total_daily_rate = market.get("total_daily_rate")
+        if total_daily_rate is None:
+            total_daily_rate = sum(
+                float(cfg.get("rate_per_day", 0) or 0)
+                for cfg in rewards_config
+            )
+
+        rate_per_day = float(total_daily_rate or 0)
         if rate_per_day <= 0:
             return 0.0
         
@@ -621,10 +627,16 @@ class MarketManager:
         if selected:
             logger.info("前5个市场（按收益比值排序）:")
             for i, market in enumerate(selected[:5], 1):
+                reward_rate = market.get("total_daily_rate")
+                if reward_rate is None:
+                    reward_rate = sum(
+                        float(cfg.get("rate_per_day", 0) or 0)
+                        for cfg in market.get("rewards_config", [])
+                    )
                 logger.info(
                     f"  {i}. {market.get('question', 'N/A')[:50]}... | "
                     f"比值: {market.get('reward_ratio', 0):.6f} | "
-                    f"奖励率: {market.get('rewards_config', [{}])[0].get('rate_per_day', 'N/A')} | "
+                    f"奖励率: {reward_rate} | "
                     f"最小份额: {market.get('rewards_min_size', 'N/A')}"
                 )
         
