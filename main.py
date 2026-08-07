@@ -8,7 +8,7 @@ import sys
 import os
 import argparse
 import threading
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from api_client import PolymarketAPIClient
 from market_manager import MarketManager
@@ -149,6 +149,107 @@ def daemonize():
     # os.close(sys.stderr.fileno())
     
     logger.info("进程已转为守护进程（后台运行）")
+
+
+def cancel_buys_before_rescan(order_manager) -> Dict[str, Any]:
+    """Cancel all tracked reward BUY orders and confirm before a blocking scan.
+
+    SELL/inventory-exit orders are never touched. Returns the OrderManager
+    confirmation result; scan_ready=False means the rescan must be deferred.
+    """
+    logger.info("重新扫描前取消当前奖励 BUY 挂单...")
+    try:
+        cancelled_count = order_manager.cancel_buy_orders_for_rescan()
+    except Exception as e:
+        logger.warning(f"重新扫描前取消 BUY 失败，延迟本次市场扫描: {e}")
+        return {
+            "scan_ready": False,
+            "confirmed": False,
+            "filled_during_cancel": False,
+            "unresolved_buys": -1,
+        }
+    logger.info(f"重新扫描前已请求取消 {cancelled_count} 个 BUY")
+    try:
+        confirmation = order_manager.confirm_buy_cancellations_for_rescan()
+    except Exception as e:
+        logger.warning(f"重新扫描前确认 BUY 取消失败，延迟本次市场扫描: {e}")
+        return {
+            "scan_ready": False,
+            "confirmed": False,
+            "filled_during_cancel": False,
+            "unresolved_buys": -1,
+        }
+    if confirmation.get("filled_during_cancel"):
+        logger.warning("重新扫描前检测到 BUY 成交，先让库存退出逻辑处理，延迟本次市场扫描")
+    elif confirmation.get("confirmed"):
+        logger.info("重新扫描前 BUY 取消确认完成")
+    else:
+        logger.warning("重新扫描前 BUY 取消未完全确认，延迟本次市场扫描")
+    return confirmation
+
+
+def perform_market_rescan(order_manager, market_manager) -> Dict[str, Any]:
+    """Run the periodic market rescan with cancel-before-scan safety.
+
+    Sequence: cancel all reward BUYs -> confirm cancellation -> scan ->
+    filter -> apply the market refresh -> place fresh BUYs for retained
+    markets through the existing full entry checks. Inventory SELL orders are
+    never touched. When cancellation cannot be confirmed (or a fill appears
+    during cancellation), the scan is skipped and the main loop resumes
+    normal order/fill/inventory monitoring.
+    """
+    confirmation = cancel_buys_before_rescan(order_manager)
+    if not confirmation.get("scan_ready", False):
+        return {
+            "scanned": False,
+            "cancellation": confirmation,
+            "reason": "buy_cancellation_not_ready",
+        }
+
+    previous_market_ids = market_manager.update_selected_market_ids()
+    logger.info(f"上一轮选择市场数: {len(previous_market_ids)}")
+
+    all_markets = market_manager.scan_rewards_markets()
+    logger.info(f"扫描到 {len(all_markets)} 个有流动性奖励的市场")
+
+    new_selected_markets = market_manager.filter_markets()
+    logger.info(f"筛选出 {len(new_selected_markets)} 个机会市场")
+
+    new_market_ids = market_manager.get_selected_market_ids()
+    refresh = order_manager.refresh_market_selection(
+        previous_market_ids,
+        new_market_ids,
+        new_selected_markets,
+    )
+
+    # 扫描前已撤掉所有 BUY：保留市场也按完整准入重新挂单
+    retained_placed = 0
+    retained_markets = [
+        m for m in new_selected_markets
+        if m.get("market_id") in refresh["retained"]
+    ]
+    for market in retained_markets:
+        placed = order_manager.place_market_orders(market, {})
+        if any(placed.values()):
+            retained_placed += 1
+
+    logger.info(
+        f"市场差量更新: retained={len(refresh['retained'])}, "
+        f"removed={len(refresh['removed'])}, "
+        f"added={len(refresh['added'])}, "
+        f"取消 BUY={refresh['cancelled_buys']}, "
+        f"新挂单市场={refresh['placed_markets']}, "
+        f"保留市场重新挂单={retained_placed}"
+    )
+
+    return {
+        "scanned": True,
+        "cancellation": confirmation,
+        "scan_count": len(all_markets) if all_markets else 0,
+        "selected_count": len(new_selected_markets) if new_selected_markets else 0,
+        "refresh": refresh,
+        "retained_placed": retained_placed,
+    }
 
 
 def main():
@@ -451,40 +552,20 @@ def main():
                         # 继续执行，不中断主循环
                         last_orderbook_update = current_time
                 
-                # 4.3 定期重新扫描和筛选市场（差量更新模式）
+                # 4.3 定期重新扫描和筛选市场（先撤 BUY，保留库存 SELL）
                 if current_time - last_market_scan >= config.update_interval_seconds:
                     logger.info("=" * 60)
-                    logger.info("重新扫描和筛选市场（差量更新）...")
+                    logger.info("重新扫描和筛选市场（先撤 BUY，保留库存 SELL）...")
                     logger.info("=" * 60)
                     
                     try:
-                        # 第一步：记录上一轮选择（独立于活跃订单集合）
-                        previous_market_ids = market_manager.update_selected_market_ids()
-                        logger.info(f"上一轮选择市场数: {len(previous_market_ids)}")
-
-                        # 第二步：扫描所有流动性奖励市场
-                        all_markets = market_manager.scan_rewards_markets()
-                        logger.info(f"扫描到 {len(all_markets)} 个有流动性奖励的市场")
-                        
-                        # 第三步：筛选最优市场
-                        new_selected_markets = market_manager.filter_markets()
-                        logger.info(f"筛选出 {len(new_selected_markets)} 个机会市场")
-                        
-                        # 第四步：差量更新（retained 保留，removed 只撤 BUY，added 完整准入后挂单）
-                        new_market_ids = market_manager.get_selected_market_ids()
-                        refresh = order_manager.refresh_market_selection(
-                            previous_market_ids,
-                            new_market_ids,
-                            new_selected_markets,
+                        rescan_result = perform_market_rescan(
+                            order_manager, market_manager
                         )
-                        logger.info(
-                            f"市场差量更新: retained={len(refresh['retained'])}, "
-                            f"removed={len(refresh['removed'])}, "
-                            f"added={len(refresh['added'])}, "
-                            f"取消 BUY={refresh['cancelled_buys']}, "
-                            f"新挂单市场={refresh['placed_markets']}"
-                        )
-                        
+                        if not rescan_result.get("scanned", False):
+                            logger.warning(
+                                "重新扫描前 BUY 取消未确认或检测到成交，延迟本次市场扫描"
+                            )
                         last_market_scan = current_time
                     except Exception as e:
                         # 使用 try-except 包裹日志记录，防止日志写入失败导致程序卡死
@@ -498,7 +579,7 @@ def main():
                                 print(f"[错误] 日志写入也失败: {log_error}", file=sys.stderr)
                             except:
                                 pass
-                        # 继续执行，不中断主循环
+                        # 继续执行，不中断主循环；旧 BUY 不自动恢复，下一轮重试
                         last_market_scan = current_time
                 
                 # 短暂休眠，避免 CPU 占用过高

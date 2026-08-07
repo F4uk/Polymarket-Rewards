@@ -1086,27 +1086,46 @@ class OrderManager:
                         f"UNKNOWN 订单保留待更多证据: order_id={order_id}"
                     )
 
-    def _process_cancel_pending(self) -> None:
-        """Confirm CANCEL_PENDING orders and keep processing fill deltas."""
+    def _process_cancel_pending(self) -> Dict[str, Any]:
+        """Confirm CANCEL_PENDING orders and keep processing fill deltas.
+
+        Returns a summary used by the pre-rescan BUY-cancellation gate:
+        filled_buys (BUY fills discovered while cancellation propagated),
+        confirmed, unresolved, and open_orders_ok (False when open orders
+        could not be queried, so cancellations cannot be considered safe).
+        """
+        result: Dict[str, Any] = {
+            "filled_buys": 0,
+            "confirmed": 0,
+            "unresolved": 0,
+            "open_orders_ok": True,
+        }
         with self.lock:
             tracking = {
                 k: dict(v) for k, v in self.cancel_pending_tracking.items()
             }
         if not tracking:
-            return
+            return result
         try:
             open_orders = self.clob_client.get_open_orders(OpenOrderParams()) or []
             open_ids = {o.get("id") for o in open_orders if o.get("id")}
         except Exception:
             open_ids = set()
+            result["open_orders_ok"] = False
         for order_id, track in tracking.items():
             if order_id in open_ids:
                 # 取消尚未传播：不重复发送取消请求，继续等待
+                result["unresolved"] += 1
                 continue
-            filled = self._query_order_filled_size(order_id)
+            filled = self._query_order_filled_size_strict(order_id)
+            if filled is None:
+                # 成交查询失败时不能确认取消：保留跟踪，等待下一次确认
+                result["unresolved"] += 1
+                continue
             with self.lock:
                 if filled > 0:
                     if track["side"] == "BUY":
+                        result["filled_buys"] += 1
                         self._handle_buy_fill(
                             track["market_id"],
                             track["token_id"],
@@ -1119,7 +1138,9 @@ class OrderManager:
                             track["market_id"], track["token_id"], order_id
                         )
                 self.cancel_pending_tracking.pop(order_id, None)
+            result["confirmed"] += 1
             logger.info(f"取消已确认: order_id={order_id}")
+        return result
     
     def place_order(
         self,
@@ -3489,6 +3510,82 @@ class OrderManager:
             logger.error(f"取消所有购买挂单失败: {e}")
         
         return cancelled_count
+
+    def cancel_buy_orders_for_rescan(self) -> int:
+        """Cancel all tracked reward BUY orders before a blocking market rescan.
+
+        Uses the existing per-order cancellation path (cancel_order): it is
+        BUY-only, preserves SELL orders and inventory-exit state, updates
+        active-order bookkeeping/exposure, and records each cancellation in
+        cancel_pending_tracking for bounded confirmation.
+        """
+        buy_order_ids: List[str] = []
+        with self.lock:
+            for market_id, tokens_dict in self.active_orders.items():
+                for token_id, sides_dict in tokens_dict.items():
+                    buy_info = sides_dict.get("BUY")
+                    if buy_info and buy_info.get("order_id"):
+                        buy_order_ids.append(buy_info["order_id"])
+        cancelled_count = 0
+        for order_id in buy_order_ids:
+            if self.cancel_order(order_id):
+                cancelled_count += 1
+                self.metrics["buys_cancelled"] += 1
+        return cancelled_count
+
+    def confirm_buy_cancellations_for_rescan(self) -> Dict[str, Any]:
+        """Bounded confirmation that no reward BUY remains live before a rescan.
+
+        Runs the existing cancellation-propagation pass once. The blocking
+        market scan must only start when scan_ready is True; CANCEL_PENDING /
+        UNKNOWN BUYs or a BUY fill discovered during cancellation defer the
+        scan back to the normal main loop.
+        """
+        try:
+            processed = self._process_cancel_pending()
+        except Exception as e:
+            logger.warning(f"确认 BUY 取消传播失败，延迟市场扫描: {e}")
+            return {
+                "scan_ready": False,
+                "confirmed": False,
+                "filled_during_cancel": False,
+                "unresolved_buys": -1,
+            }
+        if not processed.get("open_orders_ok", True):
+            logger.warning("确认 BUY 取消时 open orders 查询失败，延迟市场扫描")
+            return {
+                "scan_ready": False,
+                "confirmed": False,
+                "filled_during_cancel": False,
+                "unresolved_buys": -1,
+            }
+        unresolved = 0
+        with self.lock:
+            for market_id, tokens_dict in self.active_orders.items():
+                for token_id, sides_dict in tokens_dict.items():
+                    buy_info = sides_dict.get("BUY")
+                    if buy_info is None:
+                        continue
+                    status = buy_info.get("status", "LIVE")
+                    if status in (
+                        "LIVE",
+                        "PENDING_CONFIRMATION",
+                        "SUBMITTED",
+                        "UNKNOWN",
+                        "CANCEL_PENDING",
+                    ):
+                        unresolved += 1
+            for order_id, track in self.cancel_pending_tracking.items():
+                if track.get("side") == "BUY":
+                    unresolved += 1
+        confirmed = unresolved == 0
+        filled_during_cancel = bool(processed.get("filled_buys", 0))
+        return {
+            "scan_ready": confirmed and not filled_during_cancel,
+            "confirmed": confirmed,
+            "filled_during_cancel": filled_during_cancel,
+            "unresolved_buys": unresolved,
+        }
 
     def remove_market(self, market_id: str) -> int:
         """Remove a market from trading: cancel its BUY orders only.
