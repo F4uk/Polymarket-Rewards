@@ -158,6 +158,13 @@ def test_current_official_ticks_round_side_aware(tick):
     assert round(sell / tick, 10).is_integer()
 
 
+def test_sdk_rounding_config_supports_new_official_ticks():
+    from py_clob_client_v2.order_builder.builder import ROUNDING_CONFIG
+
+    assert "0.005" in ROUNDING_CONFIG
+    assert "0.0025" in ROUNDING_CONFIG
+
+
 def test_requote_preserves_non_default_market_tick(fake_clock):
     market = market_fixture(
         rewards_max_spread=2.0, orderPriceMinTickSize=0.001

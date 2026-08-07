@@ -1,7 +1,7 @@
 # Polymarket 自动做市机器人依赖
 requests>=2.31.0
 python-dotenv>=1.0.0
-py-clob-client-v2==1.0.1
+py-clob-client-v2==1.0.2
 httpx[socks]>=0.27.0
 
 # 本地缓存使用标准库 SQLite，无需 Redis

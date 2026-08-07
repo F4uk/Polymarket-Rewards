@@ -86,3 +86,41 @@ def test_complement_token_scoring_uses_complement_midpoint():
         orderbook_m_prime={"bids": [], "asks": []}, **common
     )
     assert score_with > score_without
+
+
+def test_zero_own_score_returns_zero_when_competitor_is_zero(monkeypatch):
+    import reward_calculator as rc
+
+    monkeypatch.setattr(
+        rc, "estimate_competitor_total_score", lambda *a, **k: (0.0, 0.0)
+    )
+    monkeypatch.setattr(rc, "estimate_our_planned_buy_score", lambda *a, **k: 0.0)
+    monkeypatch.setattr(
+        MarketMakingStrategy,
+        "calculate_order_size",
+        lambda self, market, multiplier=None: float(market.get("rewards_min_size", 0)),
+    )
+
+    manager = MarketManager(FakeAPIClient())
+    assert manager.calculate_reward_ratio(
+        _reward_market(total_daily_rate=3.0), _reward_orderbooks()
+    ) == 0.0
+
+
+def test_positive_own_score_with_zero_competitor_keeps_full_share(monkeypatch):
+    import reward_calculator as rc
+
+    monkeypatch.setattr(
+        rc, "estimate_competitor_total_score", lambda *a, **k: (0.0, 0.0)
+    )
+    monkeypatch.setattr(rc, "estimate_our_planned_buy_score", lambda *a, **k: 1.0)
+    monkeypatch.setattr(
+        MarketMakingStrategy,
+        "calculate_order_size",
+        lambda self, market, multiplier=None: float(market.get("rewards_min_size", 0)),
+    )
+
+    manager = MarketManager(FakeAPIClient())
+    assert manager.calculate_reward_ratio(
+        _reward_market(total_daily_rate=3.0), _reward_orderbooks()
+    ) == pytest.approx(3.0 / 10.0)

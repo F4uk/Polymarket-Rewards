@@ -224,7 +224,11 @@ class MarketManager:
             b=b,
             rewards_min_size=rewards_min_size,
         )
-        
+
+        # 自己的奖励分数 <= 0 时不得给出人为 100% 份额
+        if our_q_min <= 0:
+            return 0.0
+
         # 计算我们的份额占比（Equation 5: Q_normal）
         # 我们的 Q_normal = 我们的 Q_min / (我们的 Q_min + 竞争者总 Q_min)
         total_q_min = our_q_min + competitor_q_min
