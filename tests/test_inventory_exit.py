@@ -43,6 +43,13 @@ def _sell_record(om, token_id=TOKEN_A):
     return om.active_orders.get("market-1", {}).get(token_id, {}).get("SELL", {})
 
 
+def _set_hedge_gap(monkeypatch, value):
+    from config import Config
+
+    monkeypatch.setenv("HEDGE_SELL_MAX_BID_GAP", str(value))
+    monkeypatch.setattr("order_manager.config", Config())
+
+
 def test_fast_exit_zero_loss(fake_clock):
     om, clob = _make_om(fake_clock, {TOKEN_A: _book(fake_clock)})
     assert om._handle_buy_fill("market-1", TOKEN_A, 0.60, 100.0)
@@ -66,7 +73,8 @@ def test_fast_exit_one_tick_loss(fake_clock):
     assert sell.size == 100.0
 
 
-def test_bps_threshold_blocks_low_price_one_tick_fast_exit(fake_clock):
+def test_bps_threshold_blocks_low_price_one_tick_fast_exit(monkeypatch, fake_clock):
+    _set_hedge_gap(monkeypatch, 0.005)
     book = _book(fake_clock, best_bid=0.04, best_ask=0.06)
     om, clob = _make_om(fake_clock, {TOKEN_A: book})
     assert om._handle_buy_fill("market-1", TOKEN_A, 0.05, 100.0)
@@ -74,13 +82,17 @@ def test_bps_threshold_blocks_low_price_one_tick_fast_exit(fake_clock):
     state = om.inventory_exits[TOKEN_A]
     # 1 tick loss at 0.05 = 2000 bps: exceeds both immediate (300) and
     # emergency (1000) bps thresholds, so fast exit must NOT be used.
+    # 0.01 bid gap also exceeds HEDGE_SELL_MAX_BID_GAP=0.005, so the
+    # emergency path must not cross down to best bid.
     assert state["state"] == "EMERGENCY_EXIT"
     assert _sell_record(om)["purpose"] == "EMERGENCY_EXIT"
     sell = clob.post_order_calls[-1]["order"]
-    assert sell.price == 0.04  # executable at best bid
+    assert sell.price != 0.04
+    assert sell.price >= 0.05
 
 
-def test_limited_wait_timeout_goes_emergency(fake_clock):
+def test_limited_wait_timeout_goes_emergency(monkeypatch, fake_clock):
+    _set_hedge_gap(monkeypatch, 0.01)
     om, clob = _make_om(fake_clock, {TOKEN_A: _book(fake_clock, best_bid=0.58)})
     assert om._handle_buy_fill("market-1", TOKEN_A, 0.60, 100.0)
     passive = _sell_record(om)
@@ -107,18 +119,24 @@ def test_limited_wait_timeout_goes_emergency(fake_clock):
     assert state["sell_order_status"] in ("PENDING_CONFIRMATION", "LIVE")
     emergency = _sell_record(om)
     assert emergency["purpose"] == "EMERGENCY_EXIT"
-    assert clob.post_order_calls[-1]["order"].price == 0.58
+    sells = [c for c in clob.post_order_calls if c["order"].side == "SELL"]
+    assert all(c["order"].price != 0.58 for c in sells)
+    assert sells[-1]["order"].price >= 0.60
 
 
-def test_severe_loss_immediate_emergency(fake_clock):
+def test_severe_loss_immediate_emergency(monkeypatch, fake_clock):
+    _set_hedge_gap(monkeypatch, 0.03)
     om, clob = _make_om(fake_clock, {TOKEN_A: _book(fake_clock, best_bid=0.56)})
     assert om._handle_buy_fill("market-1", TOKEN_A, 0.60, 100.0)
     assert om.inventory_exits[TOKEN_A]["state"] == "EMERGENCY_EXIT"
     assert _sell_record(om)["purpose"] == "EMERGENCY_EXIT"
-    assert clob.post_order_calls[-1]["order"].price == 0.56
+    sell = clob.post_order_calls[-1]["order"]
+    assert sell.price != 0.56
+    assert sell.price >= 0.60
 
 
-def test_bid_depth_drop_triggers_emergency(fake_clock):
+def test_bid_depth_drop_triggers_emergency(monkeypatch, fake_clock):
+    _set_hedge_gap(monkeypatch, 0.02)
     om, clob = _make_om(fake_clock, {TOKEN_A: _book(fake_clock, best_bid=0.60)})
     assert om._handle_buy_fill("market-1", TOKEN_A, 0.60, 100.0)
     first_sell = _sell_record(om)["order_id"]
@@ -140,24 +158,58 @@ def test_bid_depth_drop_triggers_emergency(fake_clock):
         "LIVE",
     )
     assert _sell_record(om)["purpose"] == "EMERGENCY_EXIT"
-    assert clob.post_order_calls[-1]["order"].price == 0.57
+    sell = clob.post_order_calls[-1]["order"]
+    assert sell.price != 0.57
+    assert sell.price >= 0.60
 
 
 def test_spread_widening_triggers_emergency(monkeypatch, fake_clock):
     from config import Config
 
     monkeypatch.setenv("SPREAD_RANGE_MAX", "0.05")
+    monkeypatch.setenv("HEDGE_SELL_MAX_BID_GAP", "0.01")
     monkeypatch.setattr("order_manager.config", Config())
-    om, clob = _make_om(fake_clock, {TOKEN_A: _book(fake_clock, best_bid=0.60, best_ask=0.61)})
+    om, clob = _make_om(fake_clock, {TOKEN_A: _book(fake_clock, best_bid=0.58, best_ask=0.60)})
     assert om._handle_buy_fill("market-1", TOKEN_A, 0.60, 100.0)
-    assert _sell_record(om)["purpose"] == "FAST_EXIT"
+    assert _sell_record(om)["purpose"] == "LIMITED_WAIT_EXIT"
 
-    om.api_client.orderbook_source.orderbooks[TOKEN_A] = _book(fake_clock, best_bid=0.60, best_ask=0.68)
+    om.api_client.orderbook_source.orderbooks[TOKEN_A] = _book(fake_clock, best_bid=0.58, best_ask=0.68)
     om.check_inventory_exits()
     assert om.inventory_exits[TOKEN_A]["state"] == "EMERGENCY_EXIT"
     assert om.inventory_exits[TOKEN_A]["sell_order_status"] == "CANCEL_PENDING"
     om.check_inventory_exits()
     assert _sell_record(om)["purpose"] == "EMERGENCY_EXIT"
+    sell = clob.post_order_calls[-1]["order"]
+    assert sell.price != 0.58
+    assert sell.price >= 0.60
+
+
+def test_large_best_bid_loss_regression_044_033_not_crossed(monkeypatch, fake_clock):
+    _set_hedge_gap(monkeypatch, 0.03)
+    om, clob = _make_om(
+        fake_clock,
+        {TOKEN_A: _book(fake_clock, best_bid=0.33, best_ask=0.35)},
+    )
+    assert om._handle_buy_fill("market-1", TOKEN_A, 0.44, 100.0)
+
+    state = om.inventory_exits[TOKEN_A]
+    assert state["state"] == "EMERGENCY_EXIT"
+    assert _sell_record(om)["purpose"] == "EMERGENCY_EXIT"
+    sell = clob.post_order_calls[-1]["order"]
+    assert sell.price != 0.33
+    assert sell.price >= 0.44
+
+
+def test_small_loss_inside_gap_uses_best_bid(monkeypatch, fake_clock):
+    _set_hedge_gap(monkeypatch, 0.03)
+    om, clob = _make_om(
+        fake_clock,
+        {TOKEN_A: _book(fake_clock, best_bid=0.42, best_ask=0.44)},
+    )
+    assert om._handle_buy_fill("market-1", TOKEN_A, 0.44, 100.0)
+
+    sell = clob.post_order_calls[-1]["order"]
+    assert sell.price == 0.42
 
 
 def test_position_api_delay_does_not_abandon_exit(fake_clock):

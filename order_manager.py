@@ -638,6 +638,15 @@ class OrderManager:
         tick_size = self.strategy.get_order_price_min_tick_size(
             self.market_data_cache.get(market_id)
         )
+        # 所有库存退出统一走原 hedge 价格规则：仅在
+        # HEDGE_SELL_MAX_BID_GAP 内允许使用 best bid，超出时回退到
+        # 入场价/市场价 + 最小利润，禁止无限亏损甩卖。
+        exit_price = self.strategy.calculate_hedge_sell_price(
+            entry_price,
+            market=self.market_data_cache.get(market_id),
+            best_bid_price=best_bid,
+            max_bid_gap=config.hedge_sell_max_bid_gap,
+        )
         loss_per_unit = max(0.0, entry_price - best_bid)
         loss_ticks = round(loss_per_unit / tick_size, 10)
         loss_bps = (loss_per_unit / entry_price * 10000.0) if entry_price > 0 else 0.0
@@ -703,7 +712,6 @@ class OrderManager:
                         # 在确认取消前不得提交覆盖相同库存的新 SELL。
                         current["sell_order_status"] = "CANCEL_PENDING"
                 return
-            exit_price = self.strategy.immediate_exit_price(best_bid, tick_size)
             self._submit_inventory_sell(
                 token_id, exit_price, state["remaining_size"], "EMERGENCY_EXIT"
             )
@@ -715,7 +723,6 @@ class OrderManager:
                 if current is not None:
                     current["state"] = "FAST_EXIT"
                     current["last_action_at"] = now
-            exit_price = self.strategy.immediate_exit_price(best_bid, tick_size)
             self._submit_inventory_sell(
                 token_id, exit_price, state["remaining_size"], "FAST_EXIT"
             )
@@ -728,9 +735,8 @@ class OrderManager:
                 current["state"] = "LIMITED_WAIT"
                 current["last_action_at"] = now
         if not state.get("sell_order_id") or state.get("sell_order_status") in ("CANCELLED", "FAILED"):
-            passive_price = self.strategy.round_price_to_tick(entry_price, tick_size, "SELL")
             self._submit_inventory_sell(
-                token_id, passive_price, state["remaining_size"], "LIMITED_WAIT_EXIT"
+                token_id, exit_price, state["remaining_size"], "LIMITED_WAIT_EXIT"
             )
 
     def _confirm_inventory_sells(self, token_id: str) -> None:
@@ -1133,8 +1139,8 @@ class OrderManager:
         market = self.market_data_cache.get(market_id)
         tick_size = self.strategy.get_order_price_min_tick_size(market)
         if purpose in ("FAST_EXIT", "EMERGENCY_EXIT"):
-            # 立即退出卖价已由 immediate_exit_price 向下对齐到 tick 且不高于 best bid；
-            # 此处禁止再次向上取整，否则会离开可成交价格。
+            # 退出卖价已由 calculate_hedge_sell_price 完成 tick 规范化；
+            # 此处禁止再次取整，避免在 gap 内使用 best bid 时向上偏离可成交价。
             price = round(float(price), 10)
         else:
             price = self.strategy.round_price_to_tick(price, tick_size, side)
