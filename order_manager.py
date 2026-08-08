@@ -645,9 +645,9 @@ class OrderManager:
                 f"库存退出：订单簿过期，token={token_id[:20]}... 暂不卖出"
             )
             return
-        if normalized.is_empty or normalized.is_one_sided or normalized.best_bid is None:
+        if normalized.is_empty or normalized.best_bid is None:
             logger.warning(
-                f"库存退出：订单簿不可用（empty/one-sided），token={token_id[:20]}..."
+                f"库存退出：订单簿不可用（empty/no best bid），token={token_id[:20]}..."
             )
             return
 
@@ -659,7 +659,11 @@ class OrderManager:
         loss_per_unit = downside_gap
         loss_ticks = round(loss_per_unit / tick_size, 10)
         loss_bps = (loss_per_unit / entry_price * 10000.0) if entry_price > 0 else 0.0
-        spread = (normalized.best_ask - best_bid) if normalized.best_ask is not None else 0.0
+        spread = (
+            normalized.best_ask - best_bid
+            if normalized.best_ask is not None
+            else None
+        )
         passive_price = self.strategy.round_price_to_tick(
             entry_price,
             tick_size,
@@ -706,7 +710,10 @@ class OrderManager:
             and hold_seconds >= config.exit_passive_wait_seconds
         ):
             emergency = True
-        if spread > (config.spread_range.get("max") or float("inf")):
+        if (
+            spread is not None
+            and spread > (config.spread_range.get("max") or float("inf"))
+        ):
             emergency = True
         if normalized.is_crossed:
             emergency = True

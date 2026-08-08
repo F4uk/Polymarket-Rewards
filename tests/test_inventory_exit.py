@@ -93,6 +93,80 @@ def test_fast_exit_one_tick_small_loss_044_043(monkeypatch, fake_clock):
     assert sell.size == 100.0
 
 
+def test_bid_only_fill_posts_fast_exit_sell(monkeypatch, fake_clock):
+    _use_runtime_profile(monkeypatch)
+    book = _book(fake_clock, best_bid=0.43, best_ask=0.45)
+    book["asks"] = []
+    om, clob = _make_om(fake_clock, {TOKEN_A: book})
+
+    assert om._handle_buy_fill("market-1", TOKEN_A, 0.44, 100.0)
+
+    state = om.inventory_exits[TOKEN_A]
+    assert state["state"] == "FAST_EXIT"
+    assert state["confirmed_filled_size"] == 100.0
+    assert len(_sell_calls(clob)) == 1
+    assert _sell_record(om)["purpose"] == "FAST_EXIT"
+    sell = clob.post_order_calls[-1]["order"]
+    assert sell.price == 0.43
+    assert sell.size == 100.0
+
+
+def test_ask_only_book_does_not_post_inventory_sell(monkeypatch, fake_clock):
+    _use_runtime_profile(monkeypatch)
+    book = _book(fake_clock, best_bid=0.43, best_ask=0.45)
+    book["bids"] = []
+    om, clob = _make_om(fake_clock, {TOKEN_A: book})
+
+    assert om._handle_buy_fill("market-1", TOKEN_A, 0.44, 100.0)
+
+    state = om.inventory_exits[TOKEN_A]
+    assert state["state"] != "FLAT"
+    assert state["remaining_size"] == 100.0
+    assert state["sell_order_id"] is None
+    assert _sell_calls(clob) == []
+
+
+def test_bid_only_extreme_loss_remains_protected(monkeypatch, fake_clock):
+    _use_runtime_profile(monkeypatch)
+    book = _book(fake_clock, best_bid=0.33, best_ask=0.35)
+    book["asks"] = []
+    om, clob = _make_om(fake_clock, {TOKEN_A: book})
+
+    assert om._handle_buy_fill("market-1", TOKEN_A, 0.44, 100.0)
+
+    state = om.inventory_exits[TOKEN_A]
+    assert state["state"] == "EMERGENCY_EXIT"
+    assert _sell_record(om)["purpose"] == "EMERGENCY_EXIT"
+    assert len(_sell_calls(clob)) == 1
+    sell = clob.post_order_calls[-1]["order"]
+    assert sell.price == 0.44
+    assert sell.price != 0.33
+
+
+def test_stale_bid_only_book_does_not_post_inventory_sell(monkeypatch, fake_clock):
+    _use_runtime_profile(monkeypatch)
+    import order_manager as order_manager_module
+
+    book = _book(fake_clock, best_bid=0.43, best_ask=0.45)
+    book["asks"] = []
+    book["_received_at"] = (
+        fake_clock.monotonic()
+        - order_manager_module.config.max_orderbook_age_seconds
+        - 1.0
+    )
+    om, clob = _make_om(fake_clock, {TOKEN_A: book})
+    stale_before = om.metrics["stale_book_rejections"]
+
+    assert om._handle_buy_fill("market-1", TOKEN_A, 0.44, 100.0)
+
+    state = om.inventory_exits[TOKEN_A]
+    assert state["state"] != "FLAT"
+    assert state["remaining_size"] == 100.0
+    assert state["sell_order_id"] is None
+    assert _sell_calls(clob) == []
+    assert om.metrics["stale_book_rejections"] == stale_before + 1
+
+
 def test_two_tick_limited_wait_then_bounded_emergency_044_042(monkeypatch, fake_clock):
     _use_runtime_profile(monkeypatch)
     om, clob = _make_om(
