@@ -125,13 +125,20 @@ class RiskManager:
         
         return True
     
-    def add_exposure(self, market_id: str, exposure_usdc: float) -> bool:
+    def add_exposure(
+        self,
+        market_id: str,
+        exposure_usdc: float,
+        *,
+        allow_over_limit: bool = False,
+    ) -> bool:
         """
         添加市场敞口（下单时调用）
         
         Args:
             market_id: 市场ID
             exposure_usdc: 要添加的敞口（USDC）
+            allow_over_limit: 仅当外部订单已提交时，保守记录超过限额的敞口
             
         Returns:
             如果添加成功返回 True，如果超过限制返回 False
@@ -141,13 +148,23 @@ class RiskManager:
             new_exposure = current_exposure + exposure_usdc
             
             # 检查是否超过限制
-            if new_exposure > self.max_exposure_per_market_usdc:
+            if (
+                new_exposure > self.max_exposure_per_market_usdc
+                and not allow_over_limit
+            ):
                 logger.warning(
                     f"市场 {market_id} 添加敞口将超过限制: "
                     f"{current_exposure:.2f} + {exposure_usdc:.2f} = {new_exposure:.2f} > "
                     f"{self.max_exposure_per_market_usdc:.2f} USDC"
                 )
                 return False
+
+            if new_exposure > self.max_exposure_per_market_usdc:
+                logger.warning(
+                    f"市场 {market_id} 已存在外部订单，保守记录超限敞口: "
+                    f"{current_exposure:.2f} + {exposure_usdc:.2f} = "
+                    f"{new_exposure:.2f} USDC"
+                )
             
             # 更新敞口
             self.market_exposures[market_id] = new_exposure

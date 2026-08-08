@@ -1037,6 +1037,7 @@ class OrderManager:
         }
 
         strict_filled: Dict[str, Optional[float]] = {}
+        risk_updates = []
         for market_id, token_id, side, info in unknowns:
             order_id = info.get("order_id")
             filled = self._query_order_filled_size_strict(order_id)
@@ -1084,6 +1085,14 @@ class OrderManager:
                     else:
                         self._confirm_inventory_sells(token_id)
                     del self.active_orders[market_id][token_id][side]
+                    if side == "BUY":
+                        risk_updates.append({
+                            "type": "buy_filled",
+                            "market_id": market_id,
+                            "exposure": float(info.get("exposure", 0) or 0),
+                            "price": info.get("price", 0),
+                            "filled_size": filled_size,
+                        })
                     logger.info(
                         f"UNKNOWN 订单对账确认成交: order_id={order_id}, "
                         f"side={side}, filled={filled_size:.2f}"
@@ -1091,6 +1100,12 @@ class OrderManager:
                 elif token_id not in positions_by_token:
                     current["status"] = "FAILED"
                     del self.active_orders[market_id][token_id][side]
+                    if side == "BUY":
+                        risk_updates.append({
+                            "type": "cancelled",
+                            "market_id": market_id,
+                            "exposure": float(info.get("exposure", 0) or 0),
+                        })
                     if side == "SELL":
                         state = self.inventory_exits.get(token_id)
                         if state and state.get("sell_order_id") == order_id:
@@ -1110,6 +1125,18 @@ class OrderManager:
                     logger.debug(
                         f"UNKNOWN 订单保留待更多证据: order_id={order_id}"
                     )
+
+        for update in risk_updates:
+            if update["exposure"] > 0:
+                self.risk_manager.remove_exposure(
+                    update["market_id"], update["exposure"]
+                )
+            if update["type"] == "buy_filled":
+                self.risk_manager.add_filled_order_exposure(
+                    update["market_id"],
+                    update["price"],
+                    update["filled_size"],
+                )
 
     def _process_cancel_pending(self) -> None:
         """Confirm CANCEL_PENDING orders and keep processing fill deltas."""
@@ -1193,6 +1220,24 @@ class OrderManager:
             logger.error(f"未知的订单方向: {side}，拒绝下单")
             return None
 
+        if side == "BUY":
+            with self.lock:
+                unresolved_order_id = next(
+                    (
+                        order_id
+                        for order_id, tracking in self.cancel_pending_tracking.items()
+                        if tracking.get("token_id") == token_id
+                        and str(tracking.get("side", "")).upper() == "BUY"
+                    ),
+                    None,
+                )
+            if unresolved_order_id:
+                logger.warning(
+                    f"token {token_id[:20]}... 仍有 CANCEL_PENDING BUY "
+                    f"{unresolved_order_id}，禁止替换下单"
+                )
+                return None
+
         # 检查敞口限制（卖出订单不受敞口限制，直接跳过检查）
         if side != "SELL":
             if not self.risk_manager.can_place_order(market_id, price, size, side):
@@ -1256,8 +1301,12 @@ class OrderManager:
                     # 计算敞口并添加到风险管理器
                     exposure = self.risk_manager.calculate_exposure(price, size, side)
                     if not self.risk_manager.add_exposure(market_id, exposure):
-                        # 订单已经在外部存在；先保留身份，再尝试清理。
+                        # 订单已经在外部存在；即使常规限额预留失败，也必须
+                        # 保守记录其经济敞口，不能将外部 BUY 当作零风险。
                         logger.warning(f"添加敞口失败，取消订单 {order_id}")
+                        self.risk_manager.add_exposure(
+                            market_id, exposure, allow_over_limit=True
+                        )
                         with self.lock:
                             self.active_orders.setdefault(market_id, {}).setdefault(
                                 token_id, {}
@@ -1267,7 +1316,7 @@ class OrderManager:
                                 "side": side,
                                 "price": price,
                                 "size": size,
-                                "exposure": 0.0,
+                                "exposure": exposure,
                                 "created_at": self._now(),
                                 "created_at_monotonic": self._monotonic(),
                                 "submitted_at": self._monotonic(),

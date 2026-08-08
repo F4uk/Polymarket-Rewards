@@ -482,7 +482,18 @@ def test_post_submit_cancel_rejection_keeps_unknown_ownership(
     monkeypatch, fake_clock
 ):
     om, clob = _make_om(fake_clock)
-    monkeypatch.setattr(om.risk_manager, "add_exposure", lambda *_args: False)
+    add_exposure = om.risk_manager.add_exposure
+
+    def fail_normal_reservation(market_id, exposure, *, allow_over_limit=False):
+        if allow_over_limit:
+            return add_exposure(
+                market_id, exposure, allow_over_limit=allow_over_limit
+            )
+        return False
+
+    monkeypatch.setattr(
+        om.risk_manager, "add_exposure", fail_normal_reservation
+    )
     clob.cancel_not_canceled = True
 
     assert om.place_order("market-1", TOKEN_A, "BUY", 0.50, 100.0) is None
@@ -491,7 +502,88 @@ def test_post_submit_cancel_rejection_keeps_unknown_ownership(
     tracked = om.active_orders["market-1"][TOKEN_A]["BUY"]
     assert tracked["order_id"] == order_id
     assert tracked["status"] == "UNKNOWN"
+    assert tracked["exposure"] == pytest.approx(50.0)
+    assert om.risk_manager.get_market_exposure("market-1") == pytest.approx(50.0)
     assert order_id not in om.cancel_pending_tracking
+
+
+def test_cancel_pending_buy_blocks_different_price_until_reconciled(fake_clock):
+    market = _market(tokens=[{"token_id": TOKEN_A, "outcome": "YES"}])
+    om, clob = _make_om(
+        fake_clock, {TOKEN_A: _book(fake_clock)}, market=market
+    )
+    response = om.place_order("market-1", TOKEN_A, "BUY", 0.50, 100.0)
+    old_order_id = response["id"]
+    clob.cancel_keep_order = True
+
+    assert om.cancel_reward_buys_for_rescan() == (1, 1)
+    assert old_order_id in om.cancel_pending_tracking
+
+    om.api_client.orderbook_source.orderbooks[TOKEN_A] = _book(
+        fake_clock, best_bid=0.65, best_ask=0.67
+    )
+    initial_buy_posts = len(
+        [call for call in clob.post_order_calls if call["order"].side == "BUY"]
+    )
+    results = om.place_market_orders(market, {})
+
+    assert results.get(TOKEN_A, False) is False
+    assert old_order_id in om.cancel_pending_tracking
+    assert len(
+        [call for call in clob.post_order_calls if call["order"].side == "BUY"]
+    ) == initial_buy_posts
+
+    clob.remove_open_order(old_order_id)
+    om._process_cancel_pending()
+    assert old_order_id not in om.cancel_pending_tracking
+
+    om.place_market_orders(market, {})
+    buy_posts = [call for call in clob.post_order_calls if call["order"].side == "BUY"]
+    assert len(buy_posts) == initial_buy_posts + 1
+    assert float(buy_posts[-1]["order"].price) != pytest.approx(0.50)
+
+
+def test_post_submit_cancel_rejection_keeps_risk_through_reconciliation(
+    monkeypatch, fake_clock
+):
+    om, clob = _make_om(fake_clock)
+    om.risk_manager.max_exposure_per_market_usdc = 75.0
+    add_exposure = om.risk_manager.add_exposure
+
+    def fail_normal_reservation(market_id, exposure, *, allow_over_limit=False):
+        if allow_over_limit:
+            return add_exposure(
+                market_id, exposure, allow_over_limit=allow_over_limit
+            )
+        return False
+
+    monkeypatch.setattr(
+        om.risk_manager, "add_exposure", fail_normal_reservation
+    )
+    clob.cancel_not_canceled = True
+
+    assert om.place_order("market-1", TOKEN_A, "BUY", 0.50, 100.0) is None
+    order_id = clob.open_orders[0]["id"]
+    tracked = om.active_orders["market-1"][TOKEN_A]["BUY"]
+    assert tracked["status"] == "UNKNOWN"
+    assert tracked["exposure"] == pytest.approx(50.0)
+    assert om.risk_manager.get_market_exposure("market-1") == pytest.approx(50.0)
+
+    assert om.place_order("market-1", TOKEN_B, "BUY", 0.50, 100.0) is None
+    assert len(clob.open_orders) == 1
+
+    om.get_positions = lambda **_kwargs: []
+    om._reconcile_unknown_orders()
+    assert tracked["status"] == "LIVE"
+    assert om.risk_manager.get_market_exposure("market-1") == pytest.approx(50.0)
+
+    clob.cancel_not_canceled = False
+    assert om.cancel_order(order_id) is True
+    om._process_cancel_pending()
+    assert om.risk_manager.get_market_exposure("market-1") == pytest.approx(0.0)
+
+    om._process_cancel_pending()
+    assert om.risk_manager.get_market_exposure("market-1") == pytest.approx(0.0)
 
 
 def test_cancel_pending_query_failures_retain_ownership_and_exposure(fake_clock):

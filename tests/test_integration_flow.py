@@ -82,6 +82,7 @@ def test_partial_fill_flow_reentry_fails_on_bad_book(fake_clock):
     state = om.inventory_exits[TOKEN_A]
     assert state["confirmed_filled_size"] == 30.0
     sell_id = state["sell_order_id"]
+    om._process_cancel_pending()
 
     # 3. SELL fills -> flat
     clob.fill_order(sell_id, 30.0)
