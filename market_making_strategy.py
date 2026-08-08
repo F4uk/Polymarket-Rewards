@@ -365,27 +365,6 @@ class MarketMakingStrategy:
         Returns:
             规范化后的价格（根据 orderPriceMinTickSize 决定小数位数，范围 [0.01, 1.0]）
         """
-        # 确定最小价格步长和小数位数
-        if order_price_min_tick_size is None:
-            # 默认使用 0.01（两位小数）
-            tick_size = 0.01
-            decimal_places = 2
-        else:
-            tick_size = float(order_price_min_tick_size)
-            # 根据 orderPriceMinTickSize 确定小数位数
-            if tick_size == 0.001:
-                decimal_places = 3
-            elif tick_size == 0.01:
-                decimal_places = 2
-            else:
-                # 对于其他值，尝试自动计算小数位数
-                # 例如：0.0001 -> 4位小数，0.1 -> 1位小数
-                tick_size_str = f"{tick_size:.10f}".rstrip('0').rstrip('.')
-                if '.' in tick_size_str:
-                    decimal_places = len(tick_size_str.split('.')[1])
-                else:
-                    decimal_places = 0
-        
         return self.round_price_to_tick(price, order_price_min_tick_size, side=side)
     
     def round_price(self, price: float) -> float:
