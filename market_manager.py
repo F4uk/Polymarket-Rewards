@@ -27,6 +27,57 @@ class MarketManager:
         # 上一轮选择的市场 ID（用于差量重扫，不通过活跃订单集合推断）
         self.previous_selected_market_ids: set = set()
         self._monotonic = time.monotonic
+
+    @staticmethod
+    def _market_type_values(market: Dict[str, Any]) -> set:
+        """Return normalized official category/tag values on a market/event."""
+        sources = [market]
+        for field in ("event", "events"):
+            related = market.get(field) or []
+            sources.extend(related if isinstance(related, list) else [related])
+        values = set()
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            entries = [source.get("category"), source.get("subcategory")]
+            for field in ("tags", "categories"):
+                related = source.get(field) or []
+                entries.extend(related if isinstance(related, list) else [related])
+            for entry in entries:
+                candidates = ((entry.get("slug"), entry.get("label"))
+                              if isinstance(entry, dict) else (entry,))
+                values.update(str(value).strip().lower() for value in candidates
+                              if value is not None and str(value).strip())
+        return values
+
+    def _load_market_type_details(self, markets: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        """Batch-load missing classification metadata from cache, then Gamma."""
+        market_ids = [str(m.get("market_id")) for m in markets if m.get("market_id")]
+        details = {}
+        cache = None
+        try:
+            from redis_orderbook_client import RedisOrderbookClient
+
+            storage = config.orderbook_service.get("storage", {})
+            cache = RedisOrderbookClient(orderbook_ttl=storage.get("orderbook_ttl", 300),
+                                         db_path=storage.get("db_path"))
+            details.update(cache.get_markets_detail_batch(market_ids))
+        except Exception as exc:
+            logger.debug(f"读取市场类型缓存失败: {exc}")
+        finally:
+            if cache is not None:
+                cache.close()
+        missing = [market_id for market_id in market_ids
+                   if not self._market_type_values(details.get(market_id, {}))]
+        if missing:
+            try:
+                for detail in self.api_client.get_markets_detail(missing):
+                    market_id = detail.get("id") or detail.get("market_id")
+                    if market_id is not None:
+                        details[str(market_id)] = detail
+            except Exception as exc:
+                logger.warning(f"获取市场类型元数据失败: {exc}")
+        return details
     
     def scan_rewards_markets(self) -> List[Dict[str, Any]]:
         """
@@ -365,6 +416,35 @@ class MarketManager:
                 logger.info(f"过滤掉 {size_filtered_count} 个最小奖励份额不在范围内的市场")
             
             markets = size_filtered_markets
+
+        # 在订单簿和奖励计算之前，仅使用官方分类元数据排除市场类型。
+        excluded_types = config.excluded_market_types
+        if excluded_types:
+            logger.info(f"excluded market types: {', '.join(sorted(excluded_types))}")
+            missing_local = [m for m in markets if not self._market_type_values(m)]
+            details = self._load_market_type_details(missing_local)
+            kept_markets = []
+            removed_by_type = {market_type: 0 for market_type in sorted(excluded_types)}
+            metadata_unavailable = 0
+            for market in markets:
+                values = self._market_type_values(market)
+                if not values:
+                    values = self._market_type_values(details.get(str(market.get("market_id")), {}))
+                matches = sorted(values & excluded_types)
+                if matches:
+                    removed_by_type[matches[0]] += 1
+                    logger.debug(f"排除市场 {market.get('market_id')}: {matches[0]} | "
+                                 f"{market.get('question', '')}")
+                elif not values:
+                    metadata_unavailable += 1
+                    logger.debug(f"市场 {market.get('market_id')} 类型元数据不可用，跳过候选")
+                else:
+                    kept_markets.append(market)
+            removed = len(markets) - len(kept_markets)
+            summary = ", ".join(f"{kind}: {count}" for kind, count in removed_by_type.items())
+            logger.info(f"market type filter removed {removed} markets "
+                        f"({summary}, metadata unavailable: {metadata_unavailable})")
+            markets = kept_markets
         
         # 批量获取订单簿数据（使用 HTTP 接口）
         # 注意：价差过滤将在获取订单簿后，使用实时价格计算
