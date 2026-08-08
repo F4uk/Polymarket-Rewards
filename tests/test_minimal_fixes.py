@@ -400,3 +400,163 @@ def test_legacy_buy_cancel_response_missing_field_keeps_block(fake_clock):
 
     assert om.retry_startup_reconciliation() is False
     assert om.startup_open_orders_blocked is True
+
+
+def test_generic_cancel_not_canceled_retains_ownership_and_exposure(fake_clock):
+    om, clob = _make_om(fake_clock)
+    response = om.place_order("market-1", TOKEN_A, "BUY", 0.50, 100.0)
+    order_id = response["id"]
+    clob.cancel_not_canceled = True
+
+    assert om.cancel_order(order_id) is False
+    assert om.active_orders["market-1"][TOKEN_A]["BUY"]["order_id"] == order_id
+    assert om.risk_manager.get_market_exposure("market-1") == pytest.approx(50.0)
+    assert order_id in {order["id"] for order in clob.open_orders}
+    assert order_id not in om.cancel_pending_tracking
+
+
+def test_rescan_rejected_cancel_is_not_counted(fake_clock):
+    om, clob = _make_om(fake_clock)
+    response = om.place_order("market-1", TOKEN_A, "BUY", 0.50, 100.0)
+    order_id = response["id"]
+    clob.cancel_not_canceled = True
+
+    assert om.cancel_reward_buys_for_rescan() == (0, 1)
+    assert om.active_orders["market-1"][TOKEN_A]["BUY"]["order_id"] == order_id
+    assert om.risk_manager.get_market_exposure("market-1") == pytest.approx(50.0)
+
+
+@pytest.mark.parametrize(
+    "cancel_response",
+    [
+        {"not_canceled": {}},
+        {"canceled": ["order-1"]},
+        {"canceled": {}, "not_canceled": {}},
+        {"canceled": ["order-1"], "not_canceled": []},
+        {"canceled": [], "not_canceled": {}},
+    ],
+)
+def test_malformed_cancel_response_never_succeeds(fake_clock, cancel_response):
+    om, clob = _make_om(fake_clock)
+    response = om.place_order("market-1", TOKEN_A, "BUY", 0.50, 100.0)
+    order_id = response["id"]
+    clob.cancel_order = lambda _payload: cancel_response
+
+    assert om.cancel_order(order_id) is False
+    assert om.active_orders["market-1"][TOKEN_A]["BUY"]["order_id"] == order_id
+    assert om.risk_manager.get_market_exposure("market-1") == pytest.approx(50.0)
+    assert order_id not in om.cancel_pending_tracking
+
+
+def test_shutdown_mixed_cancel_results_preserve_failed_orders(fake_clock):
+    om, clob = _make_om(fake_clock)
+    order_ids = []
+    for token_id in ("token-a", "token-b", "token-c"):
+        response = om.place_order("market-1", token_id, "BUY", 0.50, 100.0)
+        order_ids.append(response["id"])
+
+    confirmed_id, rejected_id, exception_id = order_ids
+
+    def mixed_cancel(payload):
+        order_id = payload.orderID
+        if order_id == confirmed_id:
+            clob.open_orders = [
+                order for order in clob.open_orders if order.get("id") != order_id
+            ]
+            return {"canceled": [order_id], "not_canceled": {}}
+        if order_id == rejected_id:
+            return {"canceled": [], "not_canceled": {order_id: "rejected"}}
+        raise RuntimeError("simulated cancel failure")
+
+    clob.cancel_order = mixed_cancel
+
+    assert om.cancel_all_buy_orders() == 1
+    assert confirmed_id in om.cancel_pending_tracking
+    assert "BUY" not in om.active_orders["market-1"].get("token-a", {})
+    assert om.active_orders["market-1"]["token-b"]["BUY"]["order_id"] == rejected_id
+    assert om.active_orders["market-1"]["token-c"]["BUY"]["order_id"] == exception_id
+    assert om.risk_manager.get_market_exposure("market-1") == pytest.approx(150.0)
+
+
+def test_post_submit_cancel_rejection_keeps_unknown_ownership(
+    monkeypatch, fake_clock
+):
+    om, clob = _make_om(fake_clock)
+    monkeypatch.setattr(om.risk_manager, "add_exposure", lambda *_args: False)
+    clob.cancel_not_canceled = True
+
+    assert om.place_order("market-1", TOKEN_A, "BUY", 0.50, 100.0) is None
+
+    order_id = clob.open_orders[0]["id"]
+    tracked = om.active_orders["market-1"][TOKEN_A]["BUY"]
+    assert tracked["order_id"] == order_id
+    assert tracked["status"] == "UNKNOWN"
+    assert order_id not in om.cancel_pending_tracking
+
+
+def test_cancel_pending_query_failures_retain_ownership_and_exposure(fake_clock):
+    om, clob = _make_om(fake_clock)
+    response = om.place_order("market-1", TOKEN_A, "BUY", 0.50, 100.0)
+    order_id = response["id"]
+    assert om.cancel_order(order_id) is True
+    assert om.risk_manager.get_market_exposure("market-1") == pytest.approx(50.0)
+
+    clob.fail_open_orders = True
+    clob.fail_trades = True
+    om._process_cancel_pending()
+    assert order_id in om.cancel_pending_tracking
+    assert om.risk_manager.get_market_exposure("market-1") == pytest.approx(50.0)
+
+    clob.fail_open_orders = False
+    om._process_cancel_pending()
+    assert order_id in om.cancel_pending_tracking
+    assert om.risk_manager.get_market_exposure("market-1") == pytest.approx(50.0)
+
+    clob.fail_trades = False
+    om._process_cancel_pending()
+    assert order_id not in om.cancel_pending_tracking
+    assert om.risk_manager.get_market_exposure("market-1") == pytest.approx(0.0)
+
+
+def test_cancel_pending_sell_query_failures_never_submit_replacement(fake_clock):
+    om, clob = _make_om(fake_clock, {TOKEN_A: _book(fake_clock, best_bid=0.57)})
+    assert om._handle_buy_fill("market-1", TOKEN_A, 0.60, 100.0)
+    state = om.inventory_exits[TOKEN_A]
+    sell_id = state["sell_order_id"]
+    clob.cancel_keep_order = True
+    assert om.cancel_order(sell_id) is True
+    assert state["sell_order_status"] == "CANCEL_PENDING"
+
+    clob.fail_open_orders = True
+    clob.fail_trades = True
+    for _ in range(3):
+        om.check_inventory_exits()
+
+    assert state["sell_order_id"] == sell_id
+    assert state["sell_order_status"] == "CANCEL_PENDING"
+    assert sell_id in {order["id"] for order in clob.open_orders}
+    assert len([c for c in clob.post_order_calls if c["order"].side == "SELL"]) == 1
+
+
+def test_missing_live_with_unavailable_evidence_enters_unknown(fake_clock):
+    om, clob = _make_om(fake_clock)
+    response = om.place_order("market-1", TOKEN_A, "BUY", 0.50, 100.0)
+    order_id = response["id"]
+    tracked = om.active_orders["market-1"][TOKEN_A]["BUY"]
+    tracked["status"] = "LIVE"
+    clob.remove_open_order(order_id)
+    clob.fail_trades = True
+
+    def fail_positions(**_kwargs):
+        raise RuntimeError("simulated positions failure")
+
+    om.get_positions = fail_positions
+    om.check_orders()
+
+    assert tracked["status"] == "UNKNOWN"
+    assert om.active_orders["market-1"][TOKEN_A]["BUY"]["order_id"] == order_id
+    assert om.risk_manager.get_market_exposure("market-1") == pytest.approx(50.0)
+
+    om.check_orders()
+    assert tracked["status"] == "UNKNOWN"
+    assert om.risk_manager.get_market_exposure("market-1") == pytest.approx(50.0)

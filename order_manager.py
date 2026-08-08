@@ -2156,12 +2156,18 @@ class OrderManager:
             # 如果有没有活跃的订单，使用持仓信息检测是否成交（优先方法）
             filled_order_ids = set()
             filled_order_sizes = {}  # order_id -> filled_size
+            missing_evidence_ok = True
             
             if missing_order_ids:
                 # 方案1：使用持仓信息检测订单成交（更可靠）
                 try:
                     logger.info(f"查询持仓信息以检测 {len(missing_order_ids)} 个不在活跃列表中的订单是否成交...")
-                    positions = self.get_positions(size_threshold=0.1, limit=1000)  # 如果0.0导致出现很多持仓零头的干扰订单
+                    positions = self._get_positions_strict(
+                        size_threshold=0.1, limit=1000
+                    )
+                    if positions is None:
+                        missing_evidence_ok = False
+                        positions = []
                     
                     # 构建 token_id -> position 的映射
                     positions_by_asset = {}
@@ -2192,7 +2198,10 @@ class OrderManager:
                                     order_original_size = order_info.get("order_info", {}).get("size", 0)
                                     
                                     # 查询交易历史获取实际成交份额
-                                    actual_filled_size = self._query_order_filled_size(order_id)
+                                    actual_filled_size = self._query_order_filled_size_strict(order_id)
+                                    if actual_filled_size is None:
+                                        missing_evidence_ok = False
+                                        continue
                                     
                                     if actual_filled_size > 0:
                                         # 有成交记录
@@ -2227,6 +2236,7 @@ class OrderManager:
                     logger.info(f"通过持仓检测: 找到 {len(filled_order_ids)} 个已成交订单")
                     
                 except Exception as e:
+                    missing_evidence_ok = False
                     logger.warning(f"查询持仓信息失败: {e}，将尝试使用交易历史查询")
                 
                 # 方案2：如果持仓检测没有找到所有订单，使用交易历史查询作为补充
@@ -2250,7 +2260,10 @@ class OrderManager:
                                 continue
                             
                             # 查询该订单的实际成交份额
-                            actual_filled_size = self._query_order_filled_size(order_id)
+                            actual_filled_size = self._query_order_filled_size_strict(order_id)
+                            if actual_filled_size is None:
+                                missing_evidence_ok = False
+                                continue
                             
                             if actual_filled_size > 0:
                                 filled_order_ids.add(order_id)
@@ -2270,6 +2283,7 @@ class OrderManager:
                         
                         logger.info(f"交易历史查询补充: 总共找到 {len(filled_order_ids)} 个已成交订单")
                     except Exception as e:
+                        missing_evidence_ok = False
                         logger.warning(f"查询交易历史失败: {e}")
                 
                 # 如果两种方法都没有找到，记录警告
@@ -2415,6 +2429,16 @@ class OrderManager:
                                     logger.error(f"检查订单成交状态时发生错误: {e}")
                             
                             elif order_id not in open_order_ids:
+                                if (
+                                    not missing_evidence_ok
+                                    and order_id not in filled_order_ids
+                                ):
+                                    order_info["status"] = "UNKNOWN"
+                                    self.metrics["unknown_order_count"] += 1
+                                    logger.warning(
+                                        f"订单缺失但二级证据不可用，进入 UNKNOWN: order_id={order_id}"
+                                    )
+                                    continue
                                 # 订单不在活跃列表中，检查是否是成交
                                 if order_id in filled_order_ids:
                                     # 订单已成交（可能是完全成交或部分成交）
