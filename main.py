@@ -251,10 +251,6 @@ def main():
             logger.info("开始为机会市场挂单...")
             logger.info("=" * 60)
             
-            # 为了向后兼容，仍然准备一个空的订单簿字典作为备用数据源
-            # 但 place_market_orders 会优先使用实时获取的数据
-            orderbooks_dict = {}
-            
             for idx, market in enumerate(selected_markets, 1):
                 if not running or order_manager.startup_open_orders_blocked:
                     break
@@ -264,13 +260,8 @@ def main():
                 logger.info(f"为市场挂单 ({idx}/{len(selected_markets)}): ID={market_id}, 问题={question[:50]}...")
                 
                 try:
-                    # 每次挂单前实时获取该市场的订单簿数据（作为备用）
-                    # place_market_orders 方法会强制实时获取，这里只是作为备用
-                    market_orderbooks = api_client.get_markets_orderbooks([market], use_cache=False)
-                    orderbooks_dict.update(market_orderbooks)
-                    
                     # 挂单（place_market_orders 会强制实时获取最新数据）
-                    results = order_manager.place_market_orders(market, orderbooks_dict)
+                    results = order_manager.place_market_orders(market, {})
                     success_count = sum(1 for v in results.values() if v)
                     total_count = len(results)
                     logger.info(f"市场 {market_id} 挂单完成: {success_count}/{total_count} 成功")
