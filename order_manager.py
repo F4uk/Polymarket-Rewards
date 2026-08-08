@@ -7,7 +7,7 @@ import sys
 import time
 import threading
 import requests
-from typing import Dict, List, Optional, Any, Tuple, Set
+from typing import Dict, List, Optional, Any, Tuple
 from py_clob_client_v2.client import ClobClient
 from py_clob_client_v2.clob_types import (
     OrderArgs,
@@ -28,6 +28,23 @@ from api_client import PolymarketAPIClient
 # WebSocket 相关导入已移除，现在使用 HTTP 接口获取订单簿
 
 logger = setup_logger("order_manager")
+
+
+def _is_cancel_confirmed(response: Any, order_id: str) -> bool:
+    """Return whether a CLOB response explicitly confirms this cancellation."""
+    if not isinstance(response, dict):
+        return False
+    if "canceled" not in response or "not_canceled" not in response:
+        return False
+    canceled = response["canceled"]
+    not_canceled = response["not_canceled"]
+    if not isinstance(canceled, (list, tuple, set)):
+        return False
+    if not isinstance(not_canceled, dict):
+        return False
+    if order_id in not_canceled:
+        return False
+    return order_id in canceled
 
 
 class OrderManager:
@@ -748,13 +765,13 @@ class OrderManager:
                 and abs(existing_price - desired_price) <= 1e-9
             ):
                 return
-            self.cancel_order(sell_id)
-            with self.lock:
-                current = self.inventory_exits.get(token_id)
-                if current is not None:
-                    # 取消传播期间保留旧订单身份与待确认份额：
-                    # 在确认取消前不得提交覆盖相同库存的新 SELL。
-                    current["sell_order_status"] = "CANCEL_PENDING"
+            if self.cancel_order(sell_id):
+                with self.lock:
+                    current = self.inventory_exits.get(token_id)
+                    if current is not None:
+                        # 取消传播期间保留旧订单身份与待确认份额：
+                        # 在确认取消前不得提交覆盖相同库存的新 SELL。
+                        current["sell_order_status"] = "CANCEL_PENDING"
             return
 
         self._submit_inventory_sell(
@@ -773,14 +790,22 @@ class OrderManager:
         if not sell_order_id:
             return
 
-        open_order_ids: Set[str] = set()
         try:
             open_orders = self.clob_client.get_open_orders(OpenOrderParams())
             open_order_ids = {o.get("id") for o in open_orders if o.get("id")}
-        except Exception:
-            open_order_ids = set()
+        except Exception as e:
+            logger.warning(
+                f"SELL 确认 open orders 查询失败，保留订单身份: "
+                f"order_id={sell_order_id}, error={e}"
+            )
+            return
 
-        total_sold = self._query_order_filled_size(sell_order_id)
+        total_sold = self._query_order_filled_size_strict(sell_order_id)
+        if total_sold is None:
+            logger.warning(
+                f"SELL 确认成交查询失败，保留订单身份: order_id={sell_order_id}"
+            )
+            return
         with self.lock:
             current = self.inventory_exits.get(token_id)
             if current is None:
@@ -1097,13 +1122,20 @@ class OrderManager:
         try:
             open_orders = self.clob_client.get_open_orders(OpenOrderParams()) or []
             open_ids = {o.get("id") for o in open_orders if o.get("id")}
-        except Exception:
-            open_ids = set()
+        except Exception as e:
+            logger.warning(f"CANCEL_PENDING open orders 查询失败，保留待确认状态: {e}")
+            return
         for order_id, track in tracking.items():
             if order_id in open_ids:
                 # 取消尚未传播：不重复发送取消请求，继续等待
                 continue
-            filled = self._query_order_filled_size(order_id)
+            filled = self._query_order_filled_size_strict(order_id)
+            if filled is None:
+                logger.warning(
+                    f"CANCEL_PENDING 成交查询失败，保留待确认状态: order_id={order_id}"
+                )
+                continue
+            filled_size = min(float(filled), float(track["size"] or filled))
             with self.lock:
                 if filled > 0:
                     if track["side"] == "BUY":
@@ -1111,7 +1143,7 @@ class OrderManager:
                             track["market_id"],
                             track["token_id"],
                             track["price"],
-                            min(float(filled), float(track["size"] or filled)),
+                            filled_size,
                         )
                     else:
                         self._confirm_inventory_sells(track["token_id"])
@@ -1119,6 +1151,16 @@ class OrderManager:
                             track["market_id"], track["token_id"], order_id
                         )
                 self.cancel_pending_tracking.pop(order_id, None)
+            if track["side"] == "BUY":
+                exposure = float(track.get("exposure", 0) or 0)
+                if exposure > 0:
+                    self.risk_manager.remove_exposure(track["market_id"], exposure)
+                accounted_filled = float(track.get("filled_size", 0) or 0)
+                new_filled = max(0.0, filled_size - accounted_filled)
+                if new_filled > 0:
+                    self.risk_manager.add_filled_order_exposure(
+                        track["market_id"], track["price"], new_filled
+                    )
             logger.info(f"取消已确认: order_id={order_id}")
     
     def place_order(
@@ -1214,12 +1256,33 @@ class OrderManager:
                     # 计算敞口并添加到风险管理器
                     exposure = self.risk_manager.calculate_exposure(price, size, side)
                     if not self.risk_manager.add_exposure(market_id, exposure):
-                        # 如果添加敞口失败，取消订单
+                        # 订单已经在外部存在；先保留身份，再尝试清理。
                         logger.warning(f"添加敞口失败，取消订单 {order_id}")
-                        try:
-                            self.clob_client.cancel_order(OrderPayload(orderID=order_id))
-                        except Exception as e:
-                            logger.error(f"取消订单失败: {e}")
+                        with self.lock:
+                            self.active_orders.setdefault(market_id, {}).setdefault(
+                                token_id, {}
+                            )[side] = {
+                                "order_id": order_id,
+                                "token_id": token_id,
+                                "side": side,
+                                "price": price,
+                                "size": size,
+                                "exposure": 0.0,
+                                "created_at": self._now(),
+                                "created_at_monotonic": self._monotonic(),
+                                "submitted_at": self._monotonic(),
+                                "status": "UNKNOWN",
+                                "purpose": purpose,
+                                "generation": generation,
+                                "response": response,
+                            }
+                        self._record_order_fingerprint(
+                            token_id, side, price, size, purpose, generation
+                        )
+                        if not self.cancel_order(order_id):
+                            logger.error(
+                                f"取消订单未确认: order_id={order_id}，保留 UNKNOWN 跟踪"
+                            )
                         return None
                     
                     # 记录订单
@@ -2643,13 +2706,6 @@ class OrderManager:
                             self.filled_buy_orders[market_id] = []
                         self.filled_buy_orders[market_id].append(filled_order_info)
 
-                    self.risk_manager.remove_exposure(market_id, order_info.get("exposure", 0))
-                    self.risk_manager.add_filled_order_exposure(
-                        market_id,
-                        order_info.get("price", 0),
-                        filled,
-                    )
-
                     try:
                         self._handle_buy_fill(
                             market_id=market_id,
@@ -2659,11 +2715,20 @@ class OrderManager:
                         )
                     except Exception as e:
                         logger.error(f"部分成交买单进入库存退出时发生错误: {e}")
-                else:
-                    self.risk_manager.remove_exposure(market_id, order_info.get("exposure", 0))
-
                 # 取消剩余部分；失败时保留订单记录并对账（不得假设已取消）
                 if self.cancel_order(order_id):
+                    if side == "BUY":
+                        self.risk_manager.remove_exposure(
+                            market_id, order_info.get("exposure", 0)
+                        )
+                        self.risk_manager.add_filled_order_exposure(
+                            market_id, order_info.get("price", 0), filled
+                        )
+                        with self.lock:
+                            track = self.cancel_pending_tracking.get(order_id)
+                            if track is not None:
+                                track["exposure"] = 0.0
+                                track["filled_size"] = filled
                     logger.info(f"已取消部分成交订单的剩余部分: 订单ID={order_id}")
                     with self.lock:
                         if (
@@ -3319,14 +3384,17 @@ class OrderManager:
             是否成功
         """
         try:
-            self.clob_client.cancel_order(OrderPayload(orderID=order_id))
+            response = self.clob_client.cancel_order(OrderPayload(orderID=order_id))
+            if not _is_cancel_confirmed(response, order_id):
+                logger.warning(
+                    f"取消订单 {order_id} 未得到结果确认: response={response}"
+                )
+                return False
             logger.info(f"订单 {order_id} 已取消")
             
             # 从活跃订单中移除并更新敞口
             # 第一阶段：在持有锁的情况下，收集需要移除的订单信息和敞口（避免死锁）
             order_info_to_remove = None
-            market_id_to_update = None
-            exposure_to_remove = 0.0
             
             with self.lock:
                 for market_id, tokens_dict in list(self.active_orders.items()):
@@ -3334,8 +3402,6 @@ class OrderManager:
                         for side, order_info in list(sides_dict.items()):
                             if order_info.get("order_id") == order_id:
                                 # 收集需要移除的信息（在锁外处理，避免死锁）
-                                market_id_to_update = market_id
-                                exposure_to_remove = order_info.get("exposure", 0)
                                 order_info_to_remove = (market_id, token_id, side)
 
                                 # 取消传播期间继续处理成交差额（CANCEL_PENDING）
@@ -3345,6 +3411,8 @@ class OrderManager:
                                     "side": side,
                                     "price": order_info.get("price", 0),
                                     "size": order_info.get("size", 0),
+                                    "exposure": order_info.get("exposure", 0),
+                                    "filled_size": order_info.get("filled_size", 0),
                                     "cancel_requested_at": self._monotonic(),
                                     "status": "CANCEL_PENDING",
                                 }
@@ -3371,12 +3439,6 @@ class OrderManager:
                     if state.get("sell_order_id") == order_id:
                         state["sell_order_status"] = "CANCEL_PENDING"
                         break
-            
-            # 第二阶段：释放锁后，移除敞口（避免死锁）
-            # risk_manager.remove_exposure 内部会获取 risk_manager 的锁，但这是不同的锁，不会死锁
-            # 但为了保持一致性，我们在锁外调用
-            if order_info_to_remove and exposure_to_remove > 0:
-                self.risk_manager.remove_exposure(market_id_to_update, exposure_to_remove)
             
             return True
         except Exception as e:
@@ -3457,37 +3519,11 @@ class OrderManager:
                 
                 # 只取消 BUY 订单
                 if side == "BUY" and order_id:
-                    try:
-                        self.clob_client.cancel_order(OrderPayload(orderID=order_id))
+                    if self.cancel_order(order_id):
                         cancelled_count += 1
                         logger.info(f"已取消购买挂单: 订单ID={order_id}")
-                    except Exception as e:
-                        logger.warning(f"取消购买挂单失败: 订单ID={order_id}, 错误={e}")
-            
-            # 清理内部状态中的 BUY 订单
-            with self.lock:
-                for market_id, tokens_dict in list(self.active_orders.items()):
-                    for token_id, sides_dict in list(tokens_dict.items()):
-                        if "BUY" in sides_dict:
-                            order_info = sides_dict["BUY"]
-                            order_id = order_info.get("order_id")
-                            
-                            # 移除敞口
-                            self.risk_manager.remove_exposure(
-                                market_id,
-                                order_info.get("exposure", 0)
-                            )
-                            
-                            # 从活跃订单中移除
-                            del sides_dict["BUY"]
-                            
-                            # 如果该 token 没有其他订单了，清理
-                            if not sides_dict:
-                                del tokens_dict[token_id]
-                    
-                    # 如果该市场没有其他订单了，清理
-                    if not tokens_dict:
-                        del self.active_orders[market_id]
+                    else:
+                        logger.warning(f"取消购买挂单未确认: 订单ID={order_id}")
             
             logger.info(f"已取消所有购买挂单: 共取消 {cancelled_count} 个订单")
             
@@ -3631,23 +3667,7 @@ class OrderManager:
                     cancel_response = self.clob_client.cancel_order(
                         OrderPayload(orderID=order_id)
                     )
-                    if not isinstance(cancel_response, dict):
-                        raise ValueError("取消接口返回未知格式")
-                    if "canceled" not in cancel_response:
-                        raise ValueError("取消接口缺少 canceled 字段")
-                    if "not_canceled" not in cancel_response:
-                        raise ValueError("取消接口缺少 not_canceled 字段")
-                    canceled = cancel_response["canceled"]
-                    not_canceled = cancel_response["not_canceled"]
-                    if not isinstance(canceled, (list, tuple, set)):
-                        raise ValueError("取消接口 canceled 字段格式异常")
-                    if not isinstance(not_canceled, dict):
-                        raise ValueError("取消接口 not_canceled 字段格式异常")
-                    if order_id in not_canceled:
-                        raise ValueError(
-                            f"取消接口明确返回失败: {not_canceled.get(order_id)}"
-                        )
-                    if order_id not in set(canceled):
+                    if not _is_cancel_confirmed(cancel_response, order_id):
                         raise ValueError("取消接口未确认订单已取消")
                     result["buys_cancelled"] += 1
                     logger.info(f"启动对账：取消遗留 BUY {order_id}")
