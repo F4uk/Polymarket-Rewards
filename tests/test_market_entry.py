@@ -463,6 +463,45 @@ def test_place_market_orders_skips_stale_book(monkeypatch, fake_clock):
     assert clob.post_order_calls == []
 
 
+def test_full_market_preflight_rejects_before_first_post(monkeypatch, fake_clock):
+    _override(monkeypatch)
+    from tests.conftest import make_order_manager
+    from tests.fakes import FakeClobClient
+
+    safe_a = _fresh_book(fake_clock, TOKEN_A, bids=[
+        {"price": "0.60", "size": "200"},
+        {"price": "0.59", "size": "200"},
+        {"price": "0.58", "size": "200"},
+        {"price": "0.57", "size": "200"},
+    ], asks=[
+        {"price": "0.62", "size": "200"},
+        {"price": "0.63", "size": "200"},
+    ])
+    stale_b = _fresh_book(fake_clock, TOKEN_B, bids=[
+        {"price": "0.40", "size": "200"},
+        {"price": "0.39", "size": "200"},
+        {"price": "0.38", "size": "200"},
+        {"price": "0.37", "size": "200"},
+    ], asks=[
+        {"price": "0.42", "size": "200"},
+        {"price": "0.43", "size": "200"},
+    ])
+    stale_b["_received_at"] = fake_clock.monotonic() - 10.0
+    api = FakeAPIClient(
+        markets=[_market()],
+        orderbooks={TOKEN_A: safe_a, TOKEN_B: stale_b},
+    )
+    clob = FakeClobClient(clock=fake_clock)
+    om = make_order_manager(api_client=api, clob_client=clob, clock=fake_clock)
+
+    results = om.place_market_orders(_market(), {})
+
+    assert results[TOKEN_A] is False
+    assert results[TOKEN_B] is False
+    assert clob.post_order_calls == []
+    assert om.get_active_orders() == {}
+
+
 def test_no_conservative_price_parameter():
     import inspect
     from market_making_strategy import MarketMakingStrategy

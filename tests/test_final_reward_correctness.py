@@ -206,6 +206,8 @@ def test_requote_preserves_non_default_market_tick(fake_clock):
     om.adjust_orders_to_reward_boundaries([market])
 
     assert clob.cancelled == ["buy-1"]
+    om._process_cancel_pending()
+    assert om.maybe_reenter_markets([market])[TOKEN_A] is True
     assert om.active_orders["market-1"][TOKEN_A]["BUY"]["price"] == 0.587
 
 

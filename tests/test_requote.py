@@ -93,6 +93,8 @@ def test_consecutive_confirmations_then_adjust(fake_clock):
     _adjust(om)
     assert clob.cancelled == ["buy-1"]
     assert om.metrics["requotes"] == 1
+    om._process_cancel_pending()
+    assert om.maybe_reenter_markets([_market()])[TOKEN_A] is True
     new_buy = om.active_orders["market-1"][TOKEN_A]["BUY"]
     assert new_buy["price"] == 0.59
 
@@ -122,6 +124,8 @@ def test_requote_cooldown(fake_clock):
     _adjust(om)
     _adjust(om)
     assert clob.cancelled == ["buy-1"]
+    om._process_cancel_pending()
+    assert om.maybe_reenter_markets([_market()])[TOKEN_A] is True
     # Immediately ask for another move; cooldown must block it.
     now = fake_clock.monotonic()
     om.active_orders["market-1"][TOKEN_A]["BUY"]["created_at"] = now
@@ -146,6 +150,8 @@ def test_new_order_lifetime(fake_clock):
     _adjust(om)
     _adjust(om)
     assert clob.cancelled == ["buy-1"]
+    om._process_cancel_pending()
+    assert om.maybe_reenter_markets([_market()])[TOKEN_A] is True
     # Replace with a fresh order and try again before MIN_QUOTE_LIFETIME_SECONDS.
     om.active_orders["market-1"][TOKEN_A]["BUY"] = {
         "order_id": "buy-2",
@@ -181,6 +187,8 @@ def test_best_bid_danger_immediate_cancel_and_replace(fake_clock):
     _adjust(om)
     assert clob.cancelled == ["buy-1"]
     assert om.metrics["safety_cancels"] == 1
+    om._process_cancel_pending()
+    assert om.maybe_reenter_markets([_market()])[TOKEN_A] is True
     assert om.active_orders["market-1"][TOKEN_A]["BUY"]["price"] == 0.59
 
 
