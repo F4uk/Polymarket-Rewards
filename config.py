@@ -166,6 +166,9 @@ class Config:
                 "min": self._env_int("REWARDS_MIN_SIZE_RANGE_MIN", None),
                 "max": self._env_int("REWARDS_MIN_SIZE_RANGE_MAX", None),
             },
+            "excluded_market_types": {item.strip().lower() for item in
+                                      (self._env_raw("EXCLUDED_MARKET_TYPES") or "").split(",")
+                                      if item.strip()},
             "min_days_until_end": self._env_int("MIN_DAYS_UNTIL_END", None),
             # 主循环
             "update_interval_seconds": self._env_int("UPDATE_INTERVAL_SECONDS", 300),
@@ -590,6 +593,11 @@ class Config:
                 max_val = None
         
         return {"min": min_val, "max": max_val}
+
+    @property
+    def excluded_market_types(self) -> set:
+        """不参与新奖励 BUY 选择的官方市场类型。"""
+        return set(self.get("excluded_market_types", set()))
     
     # 向后兼容的属性（已废弃，建议使用范围配置）
     @property
