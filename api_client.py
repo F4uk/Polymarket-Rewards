@@ -409,7 +409,7 @@ class PolymarketAPIClient:
             
             # 构建查询参数（多个 id 参数）
             # requests 库支持使用列表作为参数值，会自动转换为多个同名参数
-            response_params = {"id": market_ids, "include_tag": "true"}
+            response_params = {"id": market_ids}
             
             # 发送请求
             response = self.session.get(gamma_api_url, params=response_params, timeout=30)
