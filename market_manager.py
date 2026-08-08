@@ -67,7 +67,8 @@ class MarketManager:
         finally:
             if cache is not None:
                 cache.close()
-        missing = [market_id for market_id in market_ids if market_id not in details]
+        missing = [market_id for market_id in market_ids
+                   if not self._market_type_values(details.get(market_id, {}))]
         if missing:
             try:
                 for detail in self.api_client.get_markets_detail(missing):

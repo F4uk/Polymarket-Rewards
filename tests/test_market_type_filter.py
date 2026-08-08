@@ -200,6 +200,31 @@ def test_cached_metadata_precedes_gamma(monkeypatch):
     gamma.assert_not_called()
 
 
+def test_incomplete_cached_metadata_falls_back_to_gamma(monkeypatch):
+    _set_exclusions(monkeypatch, "weather")
+
+    class IncompleteCache:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_markets_detail_batch(self, market_ids):
+            return {"market-1": {"id": "market-1"}}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(redis_orderbook_client, "RedisOrderbookClient", IncompleteCache)
+    api = FakeAPIClient()
+    gamma = Mock(return_value=[
+        {"id": "market-1", "tags": [{"slug": "weather"}]},
+    ])
+    monkeypatch.setattr(api, "get_markets_detail", gamma)
+    assert MarketManager(api).filter_markets(
+        [market_fixture()], **FILTER_KWARGS
+    ) == []
+    gamma.assert_called_once_with(["market-1"])
+
+
 def test_gamma_failure_skips_unknown_market_without_crashing(monkeypatch):
     _set_exclusions(monkeypatch, "sports")
     _empty_cache(monkeypatch)
