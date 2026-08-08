@@ -1500,6 +1500,24 @@ class OrderManager:
         
         # 3. 更新市场数据缓存
         self.market_data_cache[market_id] = market
+
+        # 首次提交 BUY 前，以同一批实时订单簿执行完整市场准入。
+        live_orderbooks: Dict[str, Dict[str, Any]] = {}
+        for token_id in token_ids:
+            orderbook = self._get_orderbook(token_id)
+            if orderbook:
+                live_orderbooks[token_id] = orderbook
+        market_entry = self.strategy.evaluate_market_entry(
+            market,
+            live_orderbooks,
+            order_size=self.strategy.calculate_order_size(market),
+            now_monotonic=self._monotonic(),
+        )
+        if not market_entry.accepted:
+            logger.warning(
+                f"市场 {market_id} 未通过实时完整市场准入: {market_entry.reason}，不提交任何 BUY"
+            )
+            return {token_id: False for token_id in token_ids}
         
         # 4. 使用实时数据下单
         # 构建市场链接
@@ -1531,9 +1549,7 @@ class OrderManager:
                 continue
             
             # 获取订单簿数据用于计算中间价
-            orderbook = self._get_orderbook(token_id)
-            if not orderbook:
-                orderbook = orderbooks_dict.get(token_id)
+            orderbook = live_orderbooks.get(token_id)
             
             if orderbook:
                 # 计算中间价
@@ -1571,7 +1587,7 @@ class OrderManager:
                 continue
             
             # 强制实时获取订单簿数据（避免使用过期数据造成损失）
-            orderbook = self._get_orderbook(token_id)
+            orderbook = live_orderbooks.get(token_id)
 
             # 实时获取失败时不再使用备选旧数据或虚构保守价格：直接跳过挂单
             if not orderbook:
